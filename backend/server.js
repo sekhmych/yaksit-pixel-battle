@@ -29,34 +29,48 @@ const pool = new Pool({
     port: process.env.DB_PORT,
 });
 
-// Проверка подключения к БД
 pool.on('error', (err) => {
     console.error('Непредвиденная ошибка БД:', err);
 });
 
 app.use(express.static(path.join(__dirname, "public")));
 
-// === ГЛОБАЛЬНОЕ СОСТОЯНИЕ (Кэш) ===
+// === ГЛОБАЛЬНОЕ СОСТОЯНИЕ ===
 let currentSettings = { canvas_size: 50, cooldown: 2, grid_enabled: true, bg_color: '#1f2937' };
-
-// Пароль админа из переменной окружения
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin";
-
-// Блокировка от брутфорса (IP -> { count, lockUntil })
 const loginAttempts = new Map();
 const MAX_ATTEMPTS = 5;
-const LOCK_TIME_MS = 5 * 60 * 1000; // 5 минут
-
-// Хранилище кулдаунов: Map <userId, timestamp>
+const LOCK_TIME_MS = 5 * 60 * 1000;
 const userCooldowns = new Map();
 
-// Загружаем настройки из БД при старте сервера
-async function initServer() {
-    let client;
-    try {
-        client = await pool.connect();
-        console.log("Соединение с БД установлено");
+// Функция ожидания
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// Инициализация БД с повторными попытками
+async function initDatabase() {
+    let client;
+    let connected = false;
+    let attempts = 0;
+
+    console.log("Ожидание готовности базы данных...");
+
+    while (!connected) {
+        try {
+            attempts++;
+            client = await pool.connect();
+            connected = true;
+            console.log(`[${attempts}] Соединение с БД установлено успешно.`);
+        } catch (err) {
+            console.log(`[${attempts}] Ошибка подключения к БД, повторяю через 2 сек...`);
+            if (attempts > 30) {
+                console.error("Не удалось подключиться к БД после 30 попыток.");
+                process.exit(1);
+            }
+            await sleep(2000);
+        }
+    }
+
+    try {
         // 1. Создаем таблицу пикселей
         await client.query(`
             CREATE TABLE IF NOT EXISTS pixels (
@@ -80,34 +94,32 @@ async function initServer() {
             )
         `);
 
-        // 3. Вставляем базовые настройки, если их нет
+        // 3. Вставляем базовые настройки
         await client.query(`
             INSERT INTO settings (id, canvas_size, cooldown, grid_enabled, bg_color)
             VALUES (1, 50, 2, true, '#1f2937')
             ON CONFLICT (id) DO NOTHING
         `);
 
-        // 4. Миграция: добавляем колонку bg_color, если её нет
-        await client.query("ALTER TABLE settings ADD COLUMN IF NOT EXISTS bg_color VARCHAR(10) DEFAULT '#1f2937'");
-        
+        // 4. Загружаем настройки в память
         const settingsRes = await client.query(
-            "SELECT canvas_size, cooldown, grid_enabled, bg_color FROM settings WHERE id = 1",
+            "SELECT canvas_size, cooldown, grid_enabled, bg_color FROM settings WHERE id = 1"
         );
         if (settingsRes.rows.length > 0) {
             currentSettings = settingsRes.rows[0];
         }
-        console.log("Настройки загружены:", currentSettings);
+        console.log("Настройки загружены в память:", currentSettings);
+
     } catch (err) {
-        console.error("ОШИБКА ПРИ СТАРТЕ СЕРВЕРА:", err);
+        console.error("КРИТИЧЕСКАЯ ОШИБКА ИНИЦИАЛИЗАЦИИ ТАБЛИЦ:", err);
+        process.exit(1);
     } finally {
         if (client) client.release();
     }
 }
-initServer();
 
+// СОКЕТЫ
 io.on("connection", async (socket) => {
-    console.log(`[+] Пользователь подключился: ${socket.id}`);
-
     try {
         const pixelsRes = await pool.query("SELECT x, y, color, user_id FROM pixels");
         socket.emit("init_data", {
@@ -115,7 +127,7 @@ io.on("connection", async (socket) => {
             settings: currentSettings, 
         });
     } catch (err) {
-        console.error("Ошибка при инициализации данных:", err);
+        console.error("Ошибка при отправке начальных данных:", err);
     }
 
     let isAdmin = false;
@@ -124,12 +136,9 @@ io.on("connection", async (socket) => {
         try {
             const ip = socket.handshake.address;
             const attempt = loginAttempts.get(ip) || { count: 0, lockUntil: 0 };
-
             if (Date.now() < attempt.lockUntil) {
-                const waitSec = Math.ceil((attempt.lockUntil - Date.now()) / 1000);
-                return callback({ success: false, message: `Заблокировано. Ждите ${waitSec} сек.` });
+                return callback({ success: false, message: "Аккаунт временно заблокирован." });
             }
-
             if (password === ADMIN_PASSWORD) {
                 isAdmin = true;
                 loginAttempts.delete(ip); 
@@ -138,11 +147,10 @@ io.on("connection", async (socket) => {
                 attempt.count += 1;
                 if (attempt.count >= MAX_ATTEMPTS) attempt.lockUntil = Date.now() + LOCK_TIME_MS;
                 loginAttempts.set(ip, attempt);
-                return callback({ success: false, message: `Неверный пароль. Осталось попыток: ${MAX_ATTEMPTS - attempt.count}` });
+                return callback({ success: false, message: "Неверный пароль." });
             }
         } catch (err) {
-            console.error("Ошибка admin_auth:", err);
-            if (typeof callback === 'function') callback({ success: false, message: "Внутренняя ошибка сервера" });
+            if (typeof callback === 'function') callback({ success: false, message: "Ошибка сервера" });
         }
     });
 
@@ -150,9 +158,7 @@ io.on("connection", async (socket) => {
         try {
             if (!data) return;
             const { x, y, color, userId } = data;
-
             if (!userId || typeof x !== "number" || typeof y !== "number" || typeof color !== "string") return;
-
             if (x < 0 || x >= currentSettings.canvas_size || y < 0 || y >= currentSettings.canvas_size) return;
 
             const now = Date.now();
@@ -160,7 +166,6 @@ io.on("connection", async (socket) => {
             const cooldownMs = currentSettings.cooldown * 1000;
 
             if (!isAdmin && now - lastPlaced < cooldownMs - 100) return;
-
             if (!isAdmin) userCooldowns.set(userId, now);
 
             await pool.query(
@@ -172,7 +177,7 @@ io.on("connection", async (socket) => {
             );
             io.emit("pixel_update", { x, y, color, userId });
         } catch (err) {
-            console.error("ОШИБКА set_pixel:", err);
+            console.error("Ошибка set_pixel:", err);
         }
     });
 
@@ -180,10 +185,9 @@ io.on("connection", async (socket) => {
         if (!isAdmin) return;
         try {
             await pool.query("DELETE FROM pixels");
-            userCooldowns.clear(); 
             io.emit("canvas_cleared");
         } catch (err) {
-            console.error("Ошибка очистки холста:", err);
+            console.error("Ошибка очистки:", err);
         }
     });
 
@@ -202,7 +206,7 @@ io.on("connection", async (socket) => {
             currentSettings = { ...currentSettings, ...newSettings };
             io.emit("settings_updated", currentSettings);
         } catch (err) {
-            console.error("Ошибка обновления настроек:", err);
+            console.error("Ошибка сохранения настроек:", err);
         }
     });
 
@@ -212,8 +216,7 @@ io.on("connection", async (socket) => {
             const pixelsRes = await pool.query("SELECT x, y, color, user_id FROM pixels");
             if (typeof callback === 'function') callback({ success: true, pixels: pixelsRes.rows, settings: currentSettings });
         } catch (err) {
-            console.error("Export error:", err);
-            if (typeof callback === 'function') callback({ success: false, message: "Ошибка экспорта" });
+            if (typeof callback === 'function') callback({ success: false });
         }
     });
 
@@ -254,17 +257,21 @@ io.on("connection", async (socket) => {
             if (typeof callback === 'function') callback({ success: true });
         } catch (err) {
             await pool.query("ROLLBACK");
-            console.error("Import error:", err);
-            if (typeof callback === 'function') callback({ success: false, message: "Ошибка импорта: " + err.message });
+            if (typeof callback === 'function') callback({ success: false, message: err.message });
         }
     });
 
-    socket.on("disconnect", () => {
-        console.log(`[-] Пользователь отключился: ${socket.id}`);
-    });
+    socket.on("disconnect", () => {});
 });
 
-const PORT = 3000;
-server.listen(PORT, () => {
-    console.log(`Бэкенд сервер запущен на порту ${PORT}`);
-});
+// Запуск приложения
+async function startServer() {
+    await initDatabase(); // Сначала дожидаемся готовности БД и создания таблиц
+    
+    const PORT = 3000;
+    server.listen(PORT, () => {
+        console.log(`>>> СЕРВЕР ЗАПУЩЕН НА ПОРТУ ${PORT} <<<`);
+    });
+}
+
+startServer();
