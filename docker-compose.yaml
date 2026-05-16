@@ -7,15 +7,12 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: pixel-battle-app
+    env_file:
+      - .env
     environment:
-      - DB_USER=admin
-      - DB_PASSWORD=supersecretpassword
-      - DB_HOST=db
-      - DB_PORT=5432
-      - DB_NAME=pixelbattle
-      - ADMIN_PASSWORD=supersecretadmin123 # <-- Пароль для входа в админку
+      - NODE_ENV=production
     ports:
-      - "8080:3000"
+      - "8080:${PORT:-3000}"
     depends_on:
       - db
     restart: unless-stopped
@@ -25,7 +22,7 @@ services:
     image: postgres:15-alpine
     container_name: pixel-battle-db
     environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: supersecretpassword
-      POSTGRES_DB: pixelbattle
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
     restart: unless-stopped

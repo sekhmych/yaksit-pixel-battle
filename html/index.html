@@ -198,72 +198,6 @@
         </div>
     </div>
 
-    <div id="admin-panel"
-        class="hidden fixed top-20 right-2 sm:right-4 bg-gray-800 border border-red-500/50 p-4 rounded-xl shadow-2xl z-30 w-[calc(100vw-1rem)] sm:w-80 max-h-[70vh] overflow-y-auto flex-col gap-4">
-        <div class="flex justify-between items-center border-b border-gray-700 pb-2">
-            <h2 class="text-red-400 font-bold text-lg">⚙️ Admin Panel</h2>
-        </div>
-
-        <div class="bg-gray-900 p-3 rounded border border-gray-700">
-            <h3 class="text-sm text-gray-400 mb-2">Настройки холста</h3>
-            <label class="block text-xs mb-1">Размер (px):</label>
-            <input type="number" id="admin-size"
-                class="w-full bg-gray-800 p-2 rounded text-white border border-gray-600 mb-2 focus:border-blue-500 outline-none transition"
-                min="10" max="1000">
-
-            <label class="block text-xs mb-1">Ожидание (сек):</label>
-            <input type="number" id="admin-cooldown"
-                class="w-full bg-gray-800 p-2 rounded text-white border border-gray-600 mb-2 focus:border-blue-500 outline-none transition"
-                min="0" max="60">
-
-            <label class="block text-xs mb-1">Цвет фона:</label>
-            <input type="color" id="admin-bg-color"
-                class="w-full h-10 bg-gray-800 rounded border border-gray-600 mb-3 cursor-pointer">
-
-            <label class="flex items-center gap-2 text-sm cursor-pointer mb-3 select-none">
-                <input type="checkbox" id="admin-grid" class="w-4 h-4 rounded accent-blue-500">
-                Отображать сетку
-            </label>
-            <button id="btn-save-settings" class="w-full bg-blue-600 hover:bg-blue-500 active:bg-blue-700 py-2 rounded font-bold shadow transition">Сохранить для всех</button>
-            </div>
-
-            <div class="bg-gray-900 p-3 rounded border border-gray-700">
-            <h3 class="text-sm text-gray-400 mb-2">Бэкап данных</h3>
-            <div class="grid grid-cols-2 gap-2">
-                <button id="btn-export" class="bg-gray-700 hover:bg-gray-600 py-2 rounded text-xs font-bold transition">Экспорт JSON</button>
-                <button id="btn-import" class="bg-gray-700 hover:bg-gray-600 py-2 rounded text-xs font-bold transition">Импорт JSON</button>
-            </div>
-            <input type="file" id="import-file" class="hidden" accept=".json">
-            </div>
-
-            <button id="btn-nuke" class="w-full bg-red-600 hover:bg-red-500 active:bg-red-700 text-white font-bold py-2 px-4 rounded shadow transition border border-red-400">
-            💥 ОЧИСТИТЬ ХОЛСТ
-            </button>
-
-        <div class="bg-gray-900 p-3 rounded border border-gray-700 mt-2">
-            <h3 class="text-sm text-gray-400 mb-2">Лог действий:</h3>
-            <ul id="admin-log" class="text-xs font-mono text-gray-300 space-y-1 h-32 overflow-y-auto hide-scrollbar">
-            </ul>
-        </div>
-    </div>
-
-    <div id="admin-auth-modal"
-        class="hidden fixed inset-0 z-50 justify-center items-center bg-black/80 backdrop-blur-sm">
-        <div class="bg-gray-800 border border-red-500/50 p-6 rounded-xl shadow-2xl w-[90%] max-w-sm mx-auto">
-            <h3 class="text-xl font-bold mb-4 text-red-400">Вход в систему</h3>
-            <input type="password" id="admin-password-input"
-                class="w-full bg-gray-900 p-3 rounded text-white border border-gray-600 mb-2 focus:border-red-500 outline-none"
-                placeholder="Введите пароль админа">
-            <p id="admin-auth-error" class="text-red-500 text-sm mb-4 min-h-[1.25rem]"></p>
-            <div class="flex justify-end gap-3">
-                <button id="btn-admin-cancel"
-                    class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded transition font-medium">Закрыть</button>
-                <button id="btn-admin-login"
-                    class="px-4 py-2 bg-red-600 hover:bg-red-500 rounded font-bold shadow transition">Войти</button>
-            </div>
-        </div>
-    </div>
-
     <div id="custom-modal" class="fixed inset-0 z-50 justify-center items-center">
         <div
             class="bg-gray-800 border border-gray-600 p-6 rounded-xl shadow-2xl w-[90%] max-w-sm mx-auto transform transition-all scale-100">
@@ -290,15 +224,6 @@
         }
 
         class Utils {
-            static getUserId() {
-                let id = localStorage.getItem('pixel_user_id');
-                if (!id) {
-                    id = 'user_' + Math.random().toString(36).substr(2, 9);
-                    localStorage.setItem('pixel_user_id', id);
-                }
-                return id;
-            }
-
             static confirm(title, desc) {
                 return new Promise((resolve) => {
                     const modal = document.getElementById('custom-modal');
@@ -327,7 +252,7 @@
         class NetworkService {
             constructor(app) {
                 this.app = app;
-                this.socket = io();
+                this.socket = io({ withCredentials: true }); // Передаем куки
 
                 const statusIndicator = document.getElementById('connection-status');
 
@@ -338,6 +263,12 @@
                     statusIndicator.title = "Подключено";
                 });
 
+                this.socket.on('user_status', (data) => {
+                    if (data.lastPlaced) {
+                        this.app.uiManager.restoreCooldown(data.lastPlaced);
+                    }
+                });
+
                 this.socket.on('disconnect', () => {
                     statusIndicator.classList.add('bg-red-500', 'animate-pulse', 'shadow-[0_0_8px_rgba(239,68,68,0.8)]');
                     statusIndicator.classList.remove('bg-green-500', 'shadow-[0_0_8px_rgba(34,197,94,0.8)]');
@@ -345,13 +276,16 @@
                 });
 
                 this.socket.on('init_data', (data) => {
+                    if (data.userId) {
+                        this.app.userId = data.userId;
+                        document.getElementById('user-info').innerText = data.userId;
+                    }
                     this.app.updateSettings(data.settings);
                     this.app.canvasManager.loadPixels(data.pixels);
                 });
 
                 this.socket.on('pixel_update', (pixel) => {
                     this.app.canvasManager.drawPixel(pixel.x, pixel.y, pixel.color);
-                    this.app.uiManager.logAction(pixel.x, pixel.y, pixel.color, pixel.userId);
                 });
 
                 this.socket.on('settings_updated', (settings) => {
@@ -363,22 +297,8 @@
                 });
             }
 
-            authenticateAdmin(password) {
-                return new Promise((resolve) => {
-                    this.socket.emit('admin_auth', password, (response) => resolve(response));
-                });
-            }
-
-            sendPixel(x, y, color, userId) {
-                this.socket.emit('set_pixel', { x, y, color, userId });
-            }
-
-            clearCanvas() {
-                this.socket.emit('clear_canvas');
-            }
-
-            updateSettings(settings) {
-                this.socket.emit('update_settings', settings);
+            sendPixel(x, y, color) {
+                this.socket.emit('set_pixel', { x, y, color });
             }
         }
 
@@ -487,11 +407,8 @@
                 tempCanvas.height = this.canvas.height;
                 const tempCtx = tempCanvas.getContext('2d');
 
-                // Рисуем фон (опционально, если нужно сохранить текущий цвет фона)
                 tempCtx.fillStyle = this.app.settings.bg_color || '#1f2937';
                 tempCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
-
-                // Копируем пиксели с основного холста
                 tempCtx.drawImage(this.canvas, 0, 0);
 
                 const link = document.createElement('a');
@@ -517,7 +434,6 @@
             }
 
             updateCursor(clientX, clientY) {
-                // Вычисляем координаты, используя математику смещения вместо getBoundingClientRect
                 const x = Math.floor((clientX - this.offsetX) / this.scale);
                 const y = Math.floor((clientY - this.offsetY) / this.scale);
 
@@ -527,7 +443,6 @@
                     this.cursor.style.display = 'block';
                     this.cursor.style.width = `${this.scale}px`;
                     this.cursor.style.height = `${this.scale}px`;
-                    // Позиционируем через transform, синхронно с холстом
                     this.cursor.style.transform = `translate(${this.offsetX + x * this.scale}px, ${this.offsetY + y * this.scale}px)`;
                     this.cursor.style.borderColor = this.app.uiManager.currentColor;
                 } else {
@@ -638,7 +553,6 @@
             }
 
             handleInteraction(clientX, clientY) {
-                // Также используем математику смещения для взаимодействия
                 const x = Math.floor((clientX - this.offsetX) / this.scale);
                 const y = Math.floor((clientY - this.offsetY) / this.scale);
 
@@ -654,54 +568,7 @@
                 this.currentColor = AppConfig.COLORS[0];
                 this.lastPlacedTime = 0;
                 this.cooldownInterval = null;
-                this.isAdmin = false;
-                this.isAdminViewRequested = new URLSearchParams(window.location.search).get('view') === 'admin';
-
                 this.buildPalette();
-                document.getElementById('user-info').innerText = this.app.userId;
-
-                if (this.isAdminViewRequested) {
-                    this.showAdminAuth();
-                }
-            }
-
-            showAdminAuth() {
-                const modal = document.getElementById('admin-auth-modal');
-                const btnLogin = document.getElementById('btn-admin-login');
-                const btnCancel = document.getElementById('btn-admin-cancel');
-                const input = document.getElementById('admin-password-input');
-                const errorText = document.getElementById('admin-auth-error');
-
-                modal.classList.remove('hidden');
-                modal.classList.add('flex');
-
-                const attemptLogin = async () => {
-                    btnLogin.disabled = true;
-                    btnLogin.innerText = "Проверка...";
-                    const response = await this.app.network.authenticateAdmin(input.value);
-
-                    if (response.success) {
-                        modal.classList.remove('flex');
-                        modal.classList.add('hidden');
-                        this.isAdmin = true;
-                        this.initAdminPanel();
-                        this.updateAdminInputs(this.app.settings);
-                    } else {
-                        errorText.innerText = response.message;
-                        btnLogin.disabled = false;
-                        btnLogin.innerText = "Войти";
-                        input.value = '';
-                    }
-                };
-
-                btnLogin.onclick = attemptLogin;
-                input.onkeydown = (e) => { if (e.key === 'Enter') attemptLogin(); };
-
-                btnCancel.onclick = () => {
-                    modal.classList.remove('flex');
-                    modal.classList.add('hidden');
-                    window.history.replaceState({}, document.title, window.location.pathname); // Убираем параметр из URL
-                };
             }
 
             buildPalette() {
@@ -716,7 +583,6 @@
                         document.querySelectorAll('.color-btn').forEach(b => b.classList.remove('active'));
                         btn.classList.add('active');
                         this.currentColor = color;
-                        // Слегка скроллим к выбранному цвету на смартфонах
                         btn.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
                     };
                     container.appendChild(btn);
@@ -728,121 +594,34 @@
             }
 
             canPlacePixel() {
-                if (this.isAdmin) return true;
                 const now = Date.now();
                 return (now - this.lastPlacedTime) >= (this.app.settings.cooldown * 1000);
             }
 
-            startCooldown() {
-                if (this.isAdmin) return;
-                this.lastPlacedTime = Date.now();
+            restoreCooldown(lastPlacedTime) {
+                this.lastPlacedTime = parseInt(lastPlacedTime);
+                if (!this.canPlacePixel()) {
+                    this.startCooldown(true); 
+                }
+            }
+
+            startCooldown(isRestore = false) {
+                if (!isRestore) this.lastPlacedTime = Date.now();
                 const box = document.getElementById('cooldown-box');
                 const timerText = document.getElementById('cooldown-timer');
-
                 box.classList.remove('hidden');
                 box.classList.add('flex');
-
                 clearInterval(this.cooldownInterval);
                 this.cooldownInterval = setInterval(() => {
                     const elapsed = Math.floor((Date.now() - this.lastPlacedTime) / 1000);
                     const remaining = this.app.settings.cooldown - elapsed;
-
                     if (remaining <= 0) {
                         clearInterval(this.cooldownInterval);
                         box.classList.add('hidden');
-                        box.classList.remove('flex');
                     } else {
                         timerText.innerText = `${remaining}s`;
                     }
                 }, 100);
-            }
-
-            initAdminPanel() {
-                document.getElementById('admin-panel').classList.remove('hidden');
-                document.getElementById('admin-panel').classList.add('flex');
-
-                document.getElementById('btn-nuke').onclick = async () => {
-                    const confirmed = await Utils.confirm("Очистка холста", "Вы точно хотите удалить все пиксели навсегда?");
-                    if (confirmed) this.app.network.clearCanvas();
-                };
-
-                document.getElementById('btn-save-settings').onclick = () => {
-                    const newSize = parseInt(document.getElementById('admin-size').value);
-                    const newCd = parseInt(document.getElementById('admin-cooldown').value);
-                    const newGrid = document.getElementById('admin-grid').checked;
-                    const newBg = document.getElementById('admin-bg-color').value;
-                    this.app.network.updateSettings({
-                        canvas_size: newSize,
-                        cooldown: newCd,
-                        grid_enabled: newGrid,
-                        bg_color: newBg
-                    });
-                };
-
-                // Экспорт
-                document.getElementById('btn-export').onclick = () => {
-                    this.app.network.socket.emit('export_database', (response) => {
-                        if (response.success) {
-                            const dataStr = JSON.stringify(response, null, 2);
-                            const blob = new Blob([dataStr], { type: 'application/json' });
-                            const url = URL.createObjectURL(blob);
-                            const link = document.createElement('a');
-                            link.href = url;
-                            link.download = `pixel-battle-backup-${new Date().toISOString().split('T')[0]}.json`;
-                            link.click();
-                            URL.revokeObjectURL(url);
-                        } else {
-                            alert(response.message);
-                        }
-                    });
-                };
-
-                // Импорт
-                const importFile = document.getElementById('import-file');
-                document.getElementById('btn-import').onclick = () => importFile.click();
-                
-                importFile.onchange = (e) => {
-                    const file = e.target.files[0];
-                    if (!file) return;
-
-                    const reader = new FileReader();
-                    reader.onload = async (event) => {
-                        try {
-                            const data = JSON.parse(event.target.result);
-                            const confirmed = await Utils.confirm("Импорт данных", "Внимание! Все текущие пиксели будут заменены данными из файла. Продолжить?");
-                            if (confirmed) {
-                                this.app.network.socket.emit('import_database', data, (response) => {
-                                    if (response.success) {
-                                        alert("Импорт успешно завершен!");
-                                    } else {
-                                        alert(response.message);
-                                    }
-                                });
-                            }
-                        } catch (err) {
-                            alert("Ошибка чтения файла: " + err.message);
-                        }
-                        importFile.value = ''; // Сброс инпута
-                    };
-                    reader.readAsText(file);
-                };
-            }
-
-            updateAdminInputs(settings) {
-                if (!this.isAdmin) return;
-                document.getElementById('admin-size').value = settings.canvas_size;
-                document.getElementById('admin-cooldown').value = settings.cooldown;
-                document.getElementById('admin-grid').checked = settings.grid_enabled;
-                document.getElementById('admin-bg-color').value = settings.bg_color || '#1f2937';
-            }
-
-            logAction(x, y, color, uid) {
-                if (!this.isAdmin) return;
-                const log = document.getElementById('admin-log');
-                const li = document.createElement('li');
-                li.innerHTML = `<span style="color:${color}; text-shadow: 0 0 1px black;">■</span> [${x},${y}] by ${uid.substr(0, 6)}...`;
-                log.prepend(li);
-                if (log.children.length > 50) log.removeChild(log.lastChild);
             }
 
             showActionPanel(x, y, color) {
@@ -852,23 +631,17 @@
                     const preview = document.getElementById('action-color-preview');
                     const btnConfirm = document.getElementById('btn-action-confirm');
                     const btnCancel = document.getElementById('btn-action-cancel');
-
                     info.innerText = `[${x}, ${y}]`;
                     preview.style.backgroundColor = color;
                     panel.classList.remove('hidden');
                     panel.classList.add('flex');
-
                     const onConfirm = () => { cleanup(); resolve(true); };
                     const onCancel = () => { cleanup(); resolve(false); };
-
                     btnConfirm.onclick = onConfirm;
                     btnCancel.onclick = onCancel;
-
                     function cleanup() {
                         panel.classList.remove('flex');
                         panel.classList.add('hidden');
-                        btnConfirm.onclick = null;
-                        btnCancel.onclick = null;
                     }
                 });
             }
@@ -876,9 +649,8 @@
 
         class App {
             constructor() {
-                this.userId = Utils.getUserId();
+                this.userId = "Connecting...";
                 this.settings = { ...AppConfig.DEFAULT_SETTINGS };
-
                 this.uiManager = new UIManager(this);
                 this.canvasManager = new CanvasManager(this);
                 this.network = new NetworkService(this);
@@ -887,34 +659,23 @@
             updateSettings(newSettings) {
                 if (!newSettings) return;
                 this.settings = newSettings;
-                this.canvasManager.applySettings(
-                    this.settings.canvas_size,
-                    this.settings.grid_enabled,
-                    this.settings.bg_color
-                );
-                this.uiManager.updateAdminInputs(this.settings);
+                this.canvasManager.applySettings(this.settings.canvas_size, this.settings.grid_enabled, this.settings.bg_color);
             }
 
             async placePixel(x, y) {
                 if (!this.uiManager.canPlacePixel()) return;
                 const color = this.uiManager.currentColor;
-
                 this.canvasManager.showHighlight(x, y, color);
                 const confirmed = await this.uiManager.showActionPanel(x, y, color);
                 this.canvasManager.hideHighlight();
-
                 if (!confirmed) return;
-
                 this.canvasManager.drawPixel(x, y, color);
                 this.uiManager.startCooldown();
-
-                this.network.sendPixel(x, y, color, this.userId);
+                this.network.sendPixel(x, y, color);
             }
         }
 
-        window.onload = () => {
-            window.pixelApp = new App();
-        };
+        window.onload = () => { window.pixelApp = new App(); };
     </script>
 </body>
 

@@ -5,7 +5,7 @@ FROM node:20-alpine
 WORKDIR /app
 
 # Устанавливаем зависимости (как у вас было в command)
-RUN npm install express socket.io pg cors
+RUN npm install express socket.io pg cors cookie-parser passport passport-local express-session connect-pg-simple helmet csurf csrf
 
 # Копируем исходный код бэкенда и HTML внутрь контейнера
 COPY ./backend /app

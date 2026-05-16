@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Вход в админ-панель</title>
+    <script src="/tailwindcss.js"></script>
+</head>
+<body class="bg-gray-900 text-white flex items-center justify-center min-h-screen">
+    <div class="bg-gray-800 p-8 rounded-2xl shadow-2xl border border-red-500/30 w-full max-w-sm">
+        <h1 class="text-2xl font-bold mb-6 text-red-400 text-center uppercase tracking-wider">Админ-панель</h1>
+        
+        <form action="/admin/login" method="POST" class="space-y-4">
+            <div>
+                <label class="block text-xs font-bold text-gray-400 mb-1 uppercase">Пароль</label>
+                <input type="password" name="password" required
+                    class="w-full bg-gray-900 border border-gray-700 p-3 rounded-lg focus:border-red-500 outline-none transition"
+                    placeholder="Введите пароль...">
+            </div>
+            
+            <button type="submit" 
+                class="w-full bg-red-600 hover:bg-red-500 py-3 rounded-lg font-bold shadow-lg transition duration-200">
+                ВОЙТИ
+            </button>
+        </form>
+        
+        <a href="/" class="block mt-6 text-center text-sm text-gray-500 hover:text-gray-300 transition">
+            &larr; Вернуться к холсту
+        </a>
+    </div>
+</body>
+</html>

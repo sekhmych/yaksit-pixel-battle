@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Панель управления | Pixel Battle</title>
+    <script src="/tailwindcss.js"></script>
+    <script src="/socket.io.min.js"></script>
+</head>
+<body class="bg-gray-900 text-white min-h-screen p-4 sm:p-8">
+    <div class="max-w-4xl mx-auto">
+        <div class="flex justify-between items-center mb-8 border-b border-gray-800 pb-4">
+            <h1 class="text-2xl font-bold text-red-400 uppercase tracking-widest">⚙️ Панель управления</h1>
+            <div class="flex gap-4">
+                <a href="/" class="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded transition text-sm">К холсту</a>
+                <a href="/admin/logout" class="px-4 py-2 bg-red-900/50 hover:bg-red-800 rounded transition text-sm text-red-200">Выйти</a>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <!-- Настройки -->
+            <div class="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl">
+                <h2 class="text-lg font-bold mb-4 text-blue-400">Настройки холста</h2>
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Размер (пикселей)</label>
+                        <input type="number" id="admin-size" class="w-full bg-gray-900 border border-gray-700 p-3 rounded-lg focus:border-blue-500 outline-none transition">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Кулдаун (секунд)</label>
+                        <input type="number" id="admin-cooldown" class="w-full bg-gray-900 border border-gray-700 p-3 rounded-lg focus:border-blue-500 outline-none transition">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Цвет фона</label>
+                        <input type="color" id="admin-bg-color" class="w-full h-12 bg-gray-900 border border-gray-700 p-1 rounded-lg cursor-pointer">
+                    </div>
+                    <label class="flex items-center gap-3 p-3 bg-gray-900 rounded-lg border border-gray-700 cursor-pointer select-none">
+                        <input type="checkbox" id="admin-grid" class="w-5 h-5 accent-blue-500">
+                        <span class="text-sm font-bold text-gray-300">Отображать сетку</span>
+                    </label>
+                    <button id="btn-save-settings" class="w-full bg-blue-600 hover:bg-blue-500 py-3 rounded-lg font-bold shadow-lg transition">СОХРАНИТЬ ДЛЯ ВСЕХ</button>
+                </div>
+            </div>
+
+            <!-- Инструменты и БД -->
+            <div class="flex flex-col gap-6">
+                <div class="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl">
+                    <h2 class="text-lg font-bold mb-4 text-green-400">Резервное копирование</h2>
+                    <div class="grid grid-cols-2 gap-4">
+                        <button id="btn-export" class="bg-gray-700 hover:bg-gray-600 py-4 rounded-xl text-sm font-bold transition flex flex-col items-center gap-2">
+                            <span>📥 Экспорт</span>
+                            <span class="text-[10px] text-gray-400 font-normal">Скачать JSON</span>
+                        </button>
+                        <button id="btn-import" class="bg-gray-700 hover:bg-gray-600 py-4 rounded-xl text-sm font-bold transition flex flex-col items-center gap-2">
+                            <span>📤 Импорт</span>
+                            <span class="text-[10px] text-gray-400 font-normal">Загрузить JSON</span>
+                        </button>
+                    </div>
+                    <input type="file" id="import-file" class="hidden" accept=".json">
+                    
+                    <div class="mt-6 pt-6 border-t border-gray-700">
+                        <button id="btn-nuke" class="w-full bg-red-900/30 hover:bg-red-600 border border-red-500/50 text-red-200 hover:text-white py-3 rounded-lg font-bold transition">
+                            💥 ПОЛНАЯ ОЧИСТКА ХОЛСТА
+                        </button>
+                    </div>
+                </div>
+
+                <div class="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl flex-1 flex flex-col min-h-[300px]">
+                    <h2 class="text-lg font-bold mb-4 text-gray-400">Живой лог:</h2>
+                    <ul id="admin-log" class="text-xs font-mono text-gray-400 space-y-2 overflow-y-auto flex-1 max-h-[300px]">
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const socket = io();
+        let currentSettings = {};
+        const csrfMeta = document.querySelector('meta[name="csrf-token"]');
+        const csrfToken = csrfMeta ? csrfMeta.getAttribute('content') : null;
+
+        if (!csrfToken) {
+            console.error("Критическая ошибка безопасности: CSRF-токен не найден.");
+            alert("Ошибка безопасности: сессия не валидна. Пожалуйста, обновите страницу.");
+            // Блокируем интерфейс
+            document.body.innerHTML = '<div class="min-h-screen flex items-center justify-center bg-gray-900 text-red-500 font-bold p-4 text-center">Ошибка безопасности: CSRF-токен отсутствует.<br>Пожалуйста, перезагрузите страницу.</div>';
+        }
+
+        function emitWithAuth(event, data, callback) {
+            const payload = { auth: { csrfToken }, data: data };
+            if (callback) { socket.emit(event, payload, callback); } 
+            else { socket.emit(event, payload); }
+        }
+
+        // Загрузка начальных данных
+        socket.on('init_data', (data) => {
+            currentSettings = data.settings;
+            updateInputs(data.settings);
+            
+            // Загружаем историю логов
+            if (data.adminLogs) {
+                const log = document.getElementById('admin-log');
+                log.innerHTML = '';
+                data.adminLogs.forEach(entry => addLogEntry(entry));
+            }
+        });
+
+        socket.on('admin_log_entry', (entry) => {
+            addLogEntry(entry);
+        });
+
+        socket.on('settings_updated', (settings) => {
+            currentSettings = settings;
+            updateInputs(settings);
+        });
+
+        function updateInputs(s) {
+            document.getElementById('admin-size').value = s.canvas_size;
+            document.getElementById('admin-cooldown').value = s.cooldown;
+            document.getElementById('admin-grid').checked = s.grid_enabled;
+            document.getElementById('admin-bg-color').value = s.bg_color;
+        }
+
+        function addLogEntry(entry) {
+            const log = document.getElementById('admin-log');
+            const li = document.createElement('li');
+            const time = new Date(entry.created_at).toLocaleTimeString();
+            
+            let detailsStr = '';
+            if (entry.action === 'UPDATE_SETTINGS') detailsStr = 'обновил настройки';
+            if (entry.action === 'CLEAR_CANVAS') detailsStr = '💥 ОЧИСТИЛ ХОЛСТ';
+            if (entry.action === 'EXPORT_DB') detailsStr = 'экспортировал БД';
+            if (entry.action === 'IMPORT_DB') detailsStr = `импортировал БД (${entry.details.pixelCount} px)`;
+
+            li.innerHTML = `<span class="text-gray-500">[${time}]</span> <span class="text-blue-400">${entry.action}</span>: ${detailsStr}`;
+            log.prepend(li);
+            if (log.children.length > 150) log.removeChild(log.lastChild);
+        }
+
+        document.getElementById('btn-save-settings').onclick = () => {
+            emitWithAuth('update_settings', {
+                canvas_size: parseInt(document.getElementById('admin-size').value),
+                cooldown: parseInt(document.getElementById('admin-cooldown').value),
+                grid_enabled: document.getElementById('admin-grid').checked,
+                bg_color: document.getElementById('admin-bg-color').value
+            });
+        };
+
+        document.getElementById('btn-nuke').onclick = () => {
+            if (confirm("ВНИМАНИЕ! Вы точно хотите СТЕРЕТЬ ВСЕ ПИКСЕЛИ навсегава?")) {
+                emitWithAuth('clear_canvas');
+            }
+        };
+
+        // Экспорт
+        document.getElementById('btn-export').onclick = () => {
+            emitWithAuth('export_database', null, (response) => {
+                if (response.success) {
+                    const blob = new Blob([JSON.stringify(response, null, 2)], { type: 'application/json' });
+                    const url = URL.createObjectURL(blob);
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = `pixel-battle-backup-${new Date().toISOString().split('T')[0]}.json`;
+                    link.click();
+                }
+            });
+        };
+
+        // Импорт
+        const importFile = document.getElementById('import-file');
+        document.getElementById('btn-import').onclick = () => importFile.click();
+        importFile.onchange = (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = (event) => {
+                try {
+                    const data = JSON.parse(event.target.result);
+                    if (confirm("Все текущие пиксели будут удалены. Продолжить?")) {
+                        emitWithAuth('import_database', data, (res) => {
+                            if (res.success) alert("Импорт завершен!");
+                        });
+                    }
+                } catch(e) { alert("Ошибка файла"); }
+                importFile.value = '';
+            };
+            reader.readAsText(file);
+        };
+    </script>
+</body>
+</html>
