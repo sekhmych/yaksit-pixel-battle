@@ -52,20 +52,42 @@ const userCooldowns = new Map();
 
 // Загружаем настройки из БД при старте сервера
 async function initServer() {
+    let client;
     try {
-        const client = await pool.connect();
+        client = await pool.connect();
         console.log("Соединение с БД установлено");
 
-        // Читаем init.sql и выполняем его для создания таблиц
-        const initSqlPath = path.join(__dirname, "init.sql");
-        const fs = require('fs');
-        if (fs.existsSync(initSqlPath)) {
-            const initSql = fs.readFileSync(initSqlPath, 'utf8');
-            await client.query(initSql);
-            console.log("База данных инициализирована (init.sql)");
-        }
+        // 1. Создаем таблицу пикселей
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS pixels (
+                x INT,
+                y INT,
+                color VARCHAR(10) NOT NULL,
+                user_id VARCHAR(50) NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (x, y)
+            )
+        `);
 
-        // Миграция: добавляем колонку bg_color, если её нет (на случай если база была создана старой версией)
+        // 2. Создаем таблицу настроек
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS settings (
+                id INT PRIMARY KEY,
+                canvas_size INT NOT NULL,
+                cooldown INT NOT NULL,
+                grid_enabled BOOLEAN NOT NULL,
+                bg_color VARCHAR(10) DEFAULT '#1f2937'
+            )
+        `);
+
+        // 3. Вставляем базовые настройки, если их нет
+        await client.query(`
+            INSERT INTO settings (id, canvas_size, cooldown, grid_enabled, bg_color)
+            VALUES (1, 50, 2, true, '#1f2937')
+            ON CONFLICT (id) DO NOTHING
+        `);
+
+        // 4. Миграция: добавляем колонку bg_color, если её нет
         await client.query("ALTER TABLE settings ADD COLUMN IF NOT EXISTS bg_color VARCHAR(10) DEFAULT '#1f2937'");
         
         const settingsRes = await client.query(
@@ -75,9 +97,10 @@ async function initServer() {
             currentSettings = settingsRes.rows[0];
         }
         console.log("Настройки загружены:", currentSettings);
-        client.release();
     } catch (err) {
         console.error("ОШИБКА ПРИ СТАРТЕ СЕРВЕРА:", err);
+    } finally {
+        if (client) client.release();
     }
 }
 initServer();
