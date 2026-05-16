@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  # Наша база данных PostgreSQL
+  # Наша база данных PostgreSQL (ДАННЫЕ НЕ СОХРАНЯЮТСЯ ПРИ ПЕРЕЗАПУСКЕ)
   db:
     image: postgres:15-alpine
     container_name: pixel-battle-db
@@ -9,9 +9,6 @@ services:
       POSTGRES_USER: admin
       POSTGRES_PASSWORD: supersecretpassword # Замените на надежный пароль
       POSTGRES_DB: pixelbattle
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-      # Проброс локального init.sql удален ради безопасности деплоя
     ports:
       - "5432:5432"
     restart: unless-stopped
@@ -28,13 +25,9 @@ services:
       - DB_HOST=db
       - DB_PORT=5432
       - DB_NAME=pixelbattle
-      - ADMIN_PASSWORD=supersecretadmin123
+      - ADMIN_PASSWORD=supersecretadmin123 # <-- Пароль для входа в админку
     ports:
       - "8080:3000"
-    # Блок volumes удален: код теперь внутри образа, а не пробрасывается с сервера
     depends_on:
       - db
     restart: unless-stopped
-
-volumes:
-  pgdata: # Разрешенный именованный том для хранения данных БД
