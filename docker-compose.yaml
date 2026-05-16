@@ -11,32 +11,30 @@ services:
       POSTGRES_DB: pixelbattle
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./backend/init.sql:/docker-entrypoint-initdb.d/init.sql
+      # Проброс локального init.sql удален ради безопасности деплоя
     ports:
       - "5432:5432"
     restart: unless-stopped
 
   # Наш Node.js сервер с WebSockets
   app:
-    image: node:20-alpine
+    build: 
+      context: .
+      dockerfile: Dockerfile
     container_name: pixel-battle-app
-    working_dir: /app
-    command: sh -c "npm install express socket.io pg cors && node server.js"
     environment:
       - DB_USER=admin
       - DB_PASSWORD=supersecretpassword
       - DB_HOST=db
       - DB_PORT=5432
       - DB_NAME=pixelbattle
-      - ADMIN_PASSWORD=supersecretadmin123 # <-- Пароль для входа в админку
+      - ADMIN_PASSWORD=supersecretadmin123
     ports:
       - "8080:3000"
-    volumes:
-      - ./backend:/app
-      - ./html:/app/public
+    # Блок volumes удален: код теперь внутри образа, а не пробрасывается с сервера
     depends_on:
       - db
     restart: unless-stopped
 
 volumes:
-  pgdata:
+  pgdata: # Разрешенный именованный том для хранения данных БД

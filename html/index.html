@@ -1,74 +1,131 @@
 <!DOCTYPE html>
 <html lang="ru">
+
 <head>
     <meta charset="UTF-8">
-    <!-- Адаптивный viewport с поддержкой вырезов (safe-area) на современных смартфонах -->
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>Pixel Battle | Self-Hosted</title>
     <script src="tailwindcss.js"></script>
     <script src="socket.io.min.js"></script>
     <style>
         /* Запрещаем скролл браузера, выделение текста и pull-to-refresh на мобильных */
-        body { 
-            margin: 0; 
-            overflow: hidden; 
-            background-color: #1f2937; 
-            touch-action: none; 
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1f2937;
+            touch-action: none;
             overscroll-behavior: none;
             -webkit-user-select: none;
             user-select: none;
             -webkit-touch-callout: none;
         }
-        
-        #canvas-container { width: 100vw; height: 100vh; position: relative; cursor: crosshair; }
-        #pixelCanvas { position: absolute; transform-origin: 0 0; image-rendering: pixelated; box-shadow: 0 0 20px rgba(0,0,0,0.5); }
-        #grid-layer { position: absolute; transform-origin: 0 0; pointer-events: none; }
+
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+            cursor: crosshair;
+        }
+
+        #pixelCanvas {
+            position: absolute;
+            transform-origin: 0 0;
+            image-rendering: pixelated;
+            box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
+        }
+
+        #grid-layer {
+            position: absolute;
+            transform-origin: 0 0;
+            pointer-events: none;
+        }
+
         #selection-cursor {
-            position: absolute; pointer-events: none; border: 2px solid white; box-shadow: 0 0 4px black;
-            box-sizing: border-box; display: none; z-index: 10;
+            position: absolute;
+            pointer-events: none;
+            border: 2px solid white;
+            box-shadow: 0 0 4px black;
+            box-sizing: border-box;
+            display: none;
+            z-index: 10;
         }
-        
+
         /* Инструменты */
-        .color-btn { 
+        .color-btn {
             flex: 0 0 auto;
-            width: 32px; height: 32px; 
-            border-radius: 6px; cursor: pointer; 
-            transition: transform 0.1s, border 0.1s; 
-            border: 2px solid transparent; 
-            box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+            width: 32px;
+            height: 32px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: transform 0.1s, border 0.1s;
+            border: 2px solid transparent;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
         }
+
         @media (min-width: 640px) {
-            .color-btn { width: 36px; height: 36px; }
+            .color-btn {
+                width: 36px;
+                height: 36px;
+            }
         }
-        .color-btn.active { transform: scale(1.15); border-color: white; z-index: 2;}
-        
+
+        .color-btn.active {
+            transform: scale(1.15);
+            border-color: white;
+            z-index: 2;
+        }
+
         /* Скрываем скроллбар для горизонтальной палитры на мобильных */
-        .hide-scrollbar::-webkit-scrollbar { display: none; }
-        .hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
-        
+        .hide-scrollbar::-webkit-scrollbar {
+            display: none;
+        }
+
+        .hide-scrollbar {
+            -ms-overflow-style: none;
+            scrollbar-width: none;
+        }
+
         /* Модальное окно */
-        #custom-modal { display: none; background: rgba(0,0,0,0.7); backdrop-filter: blur(4px); }
-        #custom-modal.flex { display: flex; }
+        #custom-modal {
+            display: none;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(4px);
+        }
+
+        #custom-modal.flex {
+            display: flex;
+        }
 
         /* Учет Safe Areas для iOS/Android */
-        .safe-pt { padding-top: max(0.75rem, env(safe-area-inset-top)); }
-        .safe-pb { padding-bottom: max(0.75rem, env(safe-area-inset-bottom)); }
+        .safe-pt {
+            padding-top: max(0.75rem, env(safe-area-inset-top));
+        }
+
+        .safe-pb {
+            padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+        }
     </style>
 </head>
+
 <body class="text-white">
 
-    <!-- ВЕРХНЯЯ ПАНЕЛЬ -->
-    <div class="fixed top-0 left-0 w-full bg-gray-900/90 backdrop-blur border-b border-gray-700 px-3 safe-pt pb-3 flex justify-between items-center z-20 shadow-lg">
+    <div
+        class="fixed top-0 left-0 w-full bg-gray-900/90 backdrop-blur border-b border-gray-700 px-3 safe-pt pb-3 flex justify-between items-center z-20 shadow-lg">
         <div class="font-bold text-lg sm:text-xl flex items-center gap-2">
             <div><span class="text-blue-400">Pixel</span><span class="hidden sm:inline">Battle</span></div>
-            <div id="connection-status" class="w-3 h-3 rounded-full bg-red-500 animate-pulse shadow-[0_0_8px_rgba(239,68,68,0.8)]" title="Подключение к серверу..."></div>
+            <div id="connection-status"
+                class="w-3 h-3 rounded-full bg-red-500 animate-pulse shadow-[0_0_8px_rgba(239,68,68,0.8)]"
+                title="Подключение к серверу..."></div>
         </div>
         <div class="flex items-center gap-2 sm:gap-4 text-xs sm:text-sm">
             <div class="text-gray-400 flex items-center gap-1">
-                <span class="hidden sm:inline">Ваш ID:</span> 
-                <span id="user-info" class="text-white font-mono bg-gray-800 px-2 py-1 rounded truncate max-w-[80px] sm:max-w-[120px]">...</span>
+                <span class="hidden sm:inline">Ваш ID:</span>
+                <span id="user-info"
+                    class="text-white font-mono bg-gray-800 px-2 py-1 rounded truncate max-w-[80px] sm:max-w-[120px]">...</span>
             </div>
-            <div id="cooldown-box" class="hidden items-center gap-1 sm:gap-2 bg-gray-800 border border-gray-700 px-2 sm:px-3 py-1 rounded shadow-inner">
+            <div id="cooldown-box"
+                class="hidden items-center gap-1 sm:gap-2 bg-gray-800 border border-gray-700 px-2 sm:px-3 py-1 rounded shadow-inner">
                 <span class="text-gray-400 hidden sm:inline">Ожидание:</span>
                 <span class="text-gray-400 sm:hidden">⏳</span>
                 <span id="cooldown-timer" class="font-bold text-red-400">0s</span>
@@ -76,38 +133,45 @@
         </div>
     </div>
 
-    <!-- КОНТЕЙНЕР ХОЛСТА -->
     <div id="canvas-container" class="relative overflow-hidden w-screen h-screen">
         <div id="canvas-viewport" class="absolute top-0 left-0" style="transform-origin: 0 0;">
             <canvas id="pixelCanvas" class="absolute top-0 left-0" style="image-rendering: pixelated;"></canvas>
             <canvas id="grid-layer" class="absolute top-0 left-0 pointer-events-none"></canvas>
         </div>
-        <div id="selection-cursor" class="absolute pointer-events-none border-white shadow-[0_0_2px_black] z-10 box-border hidden" style="border-width: 2px;"></div>
-        <div id="active-pixel-highlight" class="absolute pointer-events-none border-white shadow-[0_0_10px_rgba(255,255,255,0.8)] z-10 box-border hidden" style="border-width: 2px;"></div>
+        <div id="selection-cursor"
+            class="absolute top-0 left-0 pointer-events-none border-white shadow-[0_0_2px_black] z-10 box-border hidden"
+            style="border-width: 2px;"></div>
+        <div id="active-pixel-highlight"
+            class="absolute top-0 left-0 pointer-events-none border-white shadow-[0_0_10px_rgba(255,255,255,0.8)] z-10 box-border hidden"
+            style="border-width: 2px;"></div>
     </div>
 
-    <!-- НИЖНЯЯ ПАНЕЛЬ ИНСТРУМЕНТОВ -->
-    <div class="fixed bottom-2 sm:bottom-4 left-1/2 transform -translate-x-1/2 bg-gray-800/95 backdrop-blur px-3 safe-pb pt-3 rounded-2xl shadow-2xl border border-gray-600 flex flex-col items-center gap-3 z-20 w-[96%] max-w-md sm:max-w-lg transition-all">
-        <!-- Палитра (Скроллится по горизонтали на смартфонах) -->
-        <div id="color-palette" class="flex gap-2 overflow-x-auto w-full pb-2 hide-scrollbar snap-x sm:flex-wrap sm:justify-center px-1"></div>
-        
-        <!-- Управление зумом -->
+    <div
+        class="fixed bottom-2 sm:bottom-4 left-1/2 transform -translate-x-1/2 bg-gray-800/95 backdrop-blur px-3 safe-pb pt-3 rounded-2xl shadow-2xl border border-gray-600 flex flex-col items-center gap-3 z-20 w-[96%] max-w-md sm:max-w-lg transition-all">
+        <div id="color-palette"
+            class="flex gap-2 overflow-x-auto w-full pb-2 hide-scrollbar snap-x sm:flex-wrap sm:justify-center px-1">
+        </div>
+
         <div class="flex gap-3 items-center w-full justify-between sm:justify-center px-2">
-            <button id="btn-zoom-out" class="w-12 h-10 sm:w-auto sm:px-4 bg-gray-700 hover:bg-gray-600 active:bg-gray-500 rounded-lg shadow border border-gray-600 font-bold text-lg flex items-center justify-center transition-colors">
+            <button id="btn-zoom-out"
+                class="w-12 h-10 sm:w-auto sm:px-4 bg-gray-700 hover:bg-gray-600 active:bg-gray-500 rounded-lg shadow border border-gray-600 font-bold text-lg flex items-center justify-center transition-colors">
                 - <span class="hidden sm:inline ml-1 text-sm font-normal">Зум</span>
             </button>
-            <button id="btn-center" class="bg-gray-700 hover:bg-gray-600 active:bg-gray-500 px-3 py-1 rounded-lg border border-gray-600 text-xs font-bold transition-colors">
+            <button id="btn-center"
+                class="bg-gray-700 hover:bg-gray-600 active:bg-gray-500 px-3 py-1 rounded-lg border border-gray-600 text-xs font-bold transition-colors">
                 Центр
             </button>
-            <span id="zoom-level" class="text-xs sm:text-sm text-gray-400 font-mono font-bold bg-gray-900 px-3 py-1 rounded-full border border-gray-700 shadow-inner">100%</span>
-            <button id="btn-zoom-in" class="w-12 h-10 sm:w-auto sm:px-4 bg-gray-700 hover:bg-gray-600 active:bg-gray-500 rounded-lg shadow border border-gray-600 font-bold text-lg flex items-center justify-center transition-colors">
+            <span id="zoom-level"
+                class="text-xs sm:text-sm text-gray-400 font-mono font-bold bg-gray-900 px-3 py-1 rounded-full border border-gray-700 shadow-inner">100%</span>
+            <button id="btn-zoom-in"
+                class="w-12 h-10 sm:w-auto sm:px-4 bg-gray-700 hover:bg-gray-600 active:bg-gray-500 rounded-lg shadow border border-gray-600 font-bold text-lg flex items-center justify-center transition-colors">
                 + <span class="hidden sm:inline ml-1 text-sm font-normal">Зум</span>
             </button>
         </div>
     </div>
 
-    <!-- ПАНЕЛЬ ПОДТВЕРЖДЕНИЯ (Floating Action Panel) -->
-    <div id="action-panel" class="hidden fixed bottom-24 left-1/2 transform -translate-x-1/2 bg-gray-900/95 backdrop-blur-md px-4 py-3 rounded-2xl shadow-2xl border border-blue-500/50 flex items-center gap-4 z-40 w-[90%] max-w-xs transition-all animate-in fade-in slide-in-from-bottom-4">
+    <div id="action-panel"
+        class="hidden fixed bottom-24 left-1/2 transform -translate-x-1/2 bg-gray-900/95 backdrop-blur-md px-4 py-3 rounded-2xl shadow-2xl border border-blue-500/50 flex items-center gap-4 z-40 w-[90%] max-w-xs transition-all animate-in fade-in slide-in-from-bottom-4">
         <div class="flex-1">
             <div class="text-[10px] text-gray-400 uppercase font-bold tracking-wider">Пиксель</div>
             <div id="action-info" class="text-sm font-mono font-bold flex items-center gap-2">
@@ -118,70 +182,88 @@
         <div class="flex gap-2">
             <button id="btn-action-cancel" class="p-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition-colors">
                 <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-                    <path fill-rule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clip-rule="evenodd" />
+                    <path fill-rule="evenodd"
+                        d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z"
+                        clip-rule="evenodd" />
                 </svg>
             </button>
-            <button id="btn-action-confirm" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 active:bg-blue-700 rounded-lg font-bold text-sm shadow-lg shadow-blue-500/20 transition-all flex items-center gap-2">
+            <button id="btn-action-confirm"
+                class="px-4 py-2 bg-blue-600 hover:bg-blue-500 active:bg-blue-700 rounded-lg font-bold text-sm shadow-lg shadow-blue-500/20 transition-all flex items-center gap-2">
                 ОК
             </button>
         </div>
     </div>
 
-    <!-- АДМИН ПАНЕЛЬ (Адаптивная) -->
-    <div id="admin-panel" class="hidden fixed top-20 right-2 sm:right-4 bg-gray-800 border border-red-500/50 p-4 rounded-xl shadow-2xl z-30 w-[calc(100vw-1rem)] sm:w-80 max-h-[70vh] overflow-y-auto flex-col gap-4">
+    <div id="admin-panel"
+        class="hidden fixed top-20 right-2 sm:right-4 bg-gray-800 border border-red-500/50 p-4 rounded-xl shadow-2xl z-30 w-[calc(100vw-1rem)] sm:w-80 max-h-[70vh] overflow-y-auto flex-col gap-4">
         <div class="flex justify-between items-center border-b border-gray-700 pb-2">
             <h2 class="text-red-400 font-bold text-lg">⚙️ Admin Panel</h2>
         </div>
-        
+
         <div class="bg-gray-900 p-3 rounded border border-gray-700">
             <h3 class="text-sm text-gray-400 mb-2">Настройки холста</h3>
             <label class="block text-xs mb-1">Размер (px):</label>
-            <input type="number" id="admin-size" class="w-full bg-gray-800 p-2 rounded text-white border border-gray-600 mb-2 focus:border-blue-500 outline-none transition" min="10" max="1000">
-            
+            <input type="number" id="admin-size"
+                class="w-full bg-gray-800 p-2 rounded text-white border border-gray-600 mb-2 focus:border-blue-500 outline-none transition"
+                min="10" max="1000">
+
             <label class="block text-xs mb-1">Ожидание (сек):</label>
-            <input type="number" id="admin-cooldown" class="w-full bg-gray-800 p-2 rounded text-white border border-gray-600 mb-2 focus:border-blue-500 outline-none transition" min="0" max="60">
-            
+            <input type="number" id="admin-cooldown"
+                class="w-full bg-gray-800 p-2 rounded text-white border border-gray-600 mb-2 focus:border-blue-500 outline-none transition"
+                min="0" max="60">
+
             <label class="block text-xs mb-1">Цвет фона:</label>
-            <input type="color" id="admin-bg-color" class="w-full h-10 bg-gray-800 rounded border border-gray-600 mb-3 cursor-pointer">
+            <input type="color" id="admin-bg-color"
+                class="w-full h-10 bg-gray-800 rounded border border-gray-600 mb-3 cursor-pointer">
 
             <label class="flex items-center gap-2 text-sm cursor-pointer mb-3 select-none">
                 <input type="checkbox" id="admin-grid" class="w-4 h-4 rounded accent-blue-500">
                 Отображать сетку
             </label>
-            <button id="btn-save-settings" class="w-full bg-blue-600 hover:bg-blue-500 active:bg-blue-700 py-2 rounded font-bold shadow transition">Сохранить для всех</button>
+            <button id="btn-save-settings"
+                class="w-full bg-blue-600 hover:bg-blue-500 active:bg-blue-700 py-2 rounded font-bold shadow transition">Сохранить
+                для всех</button>
         </div>
 
-        <button id="btn-nuke" class="w-full bg-red-600 hover:bg-red-500 active:bg-red-700 text-white font-bold py-2 px-4 rounded shadow transition border border-red-400">
+        <button id="btn-nuke"
+            class="w-full bg-red-600 hover:bg-red-500 active:bg-red-700 text-white font-bold py-2 px-4 rounded shadow transition border border-red-400">
             💥 ОЧИСТИТЬ ХОЛСТ
         </button>
 
         <div class="bg-gray-900 p-3 rounded border border-gray-700 mt-2">
             <h3 class="text-sm text-gray-400 mb-2">Лог действий:</h3>
-            <ul id="admin-log" class="text-xs font-mono text-gray-300 space-y-1 h-32 overflow-y-auto hide-scrollbar"></ul>
+            <ul id="admin-log" class="text-xs font-mono text-gray-300 space-y-1 h-32 overflow-y-auto hide-scrollbar">
+            </ul>
         </div>
     </div>
 
-    <!-- ОКНО АВТОРИЗАЦИИ АДМИНА -->
-    <div id="admin-auth-modal" class="hidden fixed inset-0 z-50 justify-center items-center bg-black/80 backdrop-blur-sm">
+    <div id="admin-auth-modal"
+        class="hidden fixed inset-0 z-50 justify-center items-center bg-black/80 backdrop-blur-sm">
         <div class="bg-gray-800 border border-red-500/50 p-6 rounded-xl shadow-2xl w-[90%] max-w-sm mx-auto">
             <h3 class="text-xl font-bold mb-4 text-red-400">Вход в систему</h3>
-            <input type="password" id="admin-password-input" class="w-full bg-gray-900 p-3 rounded text-white border border-gray-600 mb-2 focus:border-red-500 outline-none" placeholder="Введите пароль админа">
+            <input type="password" id="admin-password-input"
+                class="w-full bg-gray-900 p-3 rounded text-white border border-gray-600 mb-2 focus:border-red-500 outline-none"
+                placeholder="Введите пароль админа">
             <p id="admin-auth-error" class="text-red-500 text-sm mb-4 min-h-[1.25rem]"></p>
             <div class="flex justify-end gap-3">
-                <button id="btn-admin-cancel" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded transition font-medium">Закрыть</button>
-                <button id="btn-admin-login" class="px-4 py-2 bg-red-600 hover:bg-red-500 rounded font-bold shadow transition">Войти</button>
+                <button id="btn-admin-cancel"
+                    class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded transition font-medium">Закрыть</button>
+                <button id="btn-admin-login"
+                    class="px-4 py-2 bg-red-600 hover:bg-red-500 rounded font-bold shadow transition">Войти</button>
             </div>
         </div>
     </div>
 
-    <!-- МОДАЛЬНОЕ ОКНО -->
     <div id="custom-modal" class="fixed inset-0 z-50 justify-center items-center">
-        <div class="bg-gray-800 border border-gray-600 p-6 rounded-xl shadow-2xl w-[90%] max-w-sm mx-auto transform transition-all scale-100">
+        <div
+            class="bg-gray-800 border border-gray-600 p-6 rounded-xl shadow-2xl w-[90%] max-w-sm mx-auto transform transition-all scale-100">
             <h3 id="modal-title" class="text-xl font-bold mb-2">Внимание</h3>
             <p id="modal-desc" class="text-gray-300 mb-6 text-sm sm:text-base">Вы уверены?</p>
             <div class="flex justify-end gap-3">
-                <button id="btn-modal-cancel" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 active:bg-gray-500 rounded transition font-medium">Отмена</button>
-                <button id="btn-modal-confirm" class="px-4 py-2 bg-red-600 hover:bg-red-500 active:bg-red-700 rounded font-bold shadow transition">Да</button>
+                <button id="btn-modal-cancel"
+                    class="px-4 py-2 bg-gray-700 hover:bg-gray-600 active:bg-gray-500 rounded transition font-medium">Отмена</button>
+                <button id="btn-modal-confirm"
+                    class="px-4 py-2 bg-red-600 hover:bg-red-500 active:bg-red-700 rounded font-bold shadow transition">Да</button>
             </div>
         </div>
     </div>
@@ -235,7 +317,7 @@
         class NetworkService {
             constructor(app) {
                 this.app = app;
-                this.socket = io(); 
+                this.socket = io();
 
                 const statusIndicator = document.getElementById('connection-status');
 
@@ -301,7 +383,7 @@
                 this.gridCtx = this.gridCanvas.getContext('2d');
                 this.cursor = document.getElementById('selection-cursor');
                 this.highlight = document.getElementById('active-pixel-highlight');
-                
+
                 this.pixelsMap = new Map();
                 this.highlightedPixel = null;
 
@@ -370,13 +452,10 @@
 
             updateHighlightPosition() {
                 if (this.highlightedPixel) {
-                    const canvasRect = this.canvas.getBoundingClientRect();
                     const { x, y } = this.highlightedPixel;
-                    
                     this.highlight.style.width = `${this.scale}px`;
                     this.highlight.style.height = `${this.scale}px`;
-                    this.highlight.style.left = `${canvasRect.left + x * this.scale}px`;
-                    this.highlight.style.top = `${canvasRect.top + y * this.scale}px`;
+                    this.highlight.style.transform = `translate(${this.offsetX + x * this.scale}px, ${this.offsetY + y * this.scale}px)`;
                 }
             }
 
@@ -409,10 +488,9 @@
             }
 
             updateCursor(clientX, clientY) {
-                const canvasRect = this.canvas.getBoundingClientRect();
-                
-                const x = Math.floor((clientX - canvasRect.left) / this.scale);
-                const y = Math.floor((clientY - canvasRect.top) / this.scale);
+                // Вычисляем координаты, используя математику смещения вместо getBoundingClientRect
+                const x = Math.floor((clientX - this.offsetX) / this.scale);
+                const y = Math.floor((clientY - this.offsetY) / this.scale);
 
                 const isTouchDevice = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
 
@@ -420,8 +498,8 @@
                     this.cursor.style.display = 'block';
                     this.cursor.style.width = `${this.scale}px`;
                     this.cursor.style.height = `${this.scale}px`;
-                    this.cursor.style.left = `${canvasRect.left + x * this.scale}px`;
-                    this.cursor.style.top = `${canvasRect.top + y * this.scale}px`;
+                    // Позиционируем через transform, синхронно с холстом
+                    this.cursor.style.transform = `translate(${this.offsetX + x * this.scale}px, ${this.offsetY + y * this.scale}px)`;
                     this.cursor.style.borderColor = this.app.uiManager.currentColor;
                 } else {
                     this.cursor.style.display = 'none';
@@ -432,13 +510,13 @@
                 const oldScale = this.scale;
                 this.scale += delta;
                 this.scale = Math.max(0.5, Math.min(this.scale, 80));
-                
+
                 const cx = window.innerWidth / 2;
                 const cy = window.innerHeight / 2;
-                
+
                 this.offsetX = cx - (cx - this.offsetX) * (this.scale / oldScale);
                 this.offsetY = cy - (cy - this.offsetY) * (this.scale / oldScale);
-                
+
                 this.updateTransform();
                 this.app.uiManager.updateZoomText(this.scale);
             }
@@ -447,7 +525,7 @@
                 window.addEventListener('resize', () => {
                     this.centerCanvas();
                 });
-                
+
                 document.getElementById('btn-zoom-in').addEventListener('click', () => this.zoom(this.scale * 0.3));
                 document.getElementById('btn-zoom-out').addEventListener('click', () => this.zoom(-(this.scale * 0.3)));
                 document.getElementById('btn-center').addEventListener('click', () => this.centerCanvas());
@@ -470,7 +548,7 @@
                 });
 
                 this.container.addEventListener('mousedown', (e) => {
-                    if (e.button === 1 || (e.button === 0 && (e.shiftKey || e.ctrlKey))) { 
+                    if (e.button === 1 || (e.button === 0 && (e.shiftKey || e.ctrlKey))) {
                         this.isDragging = true;
                         this.dragStart = { x: e.clientX, y: e.clientY };
                         this.container.style.cursor = 'grabbing';
@@ -485,7 +563,7 @@
                 });
 
                 let initialPinchDistance = null;
-                
+
                 this.container.addEventListener('touchstart', (e) => {
                     if (e.touches.length === 1) {
                         this.dragStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
@@ -495,10 +573,10 @@
                             e.touches[0].clientY - e.touches[1].clientY
                         );
                     }
-                }, {passive: false});
+                }, { passive: false });
 
                 this.container.addEventListener('touchmove', (e) => {
-                    e.preventDefault(); 
+                    e.preventDefault();
                     if (e.touches.length === 1 && this.dragStart) {
                         this.offsetX += e.touches[0].clientX - this.dragStart.x;
                         this.offsetY += e.touches[0].clientY - this.dragStart.y;
@@ -513,7 +591,7 @@
                         this.zoom((currentDist - initialPinchDistance) * zoomSpeed);
                         initialPinchDistance = currentDist;
                     }
-                }, {passive: false});
+                }, { passive: false });
 
                 this.container.addEventListener('touchend', (e) => {
                     if (e.changedTouches.length === 1 && !initialPinchDistance) {
@@ -530,9 +608,9 @@
             }
 
             handleInteraction(clientX, clientY) {
-                const rect = this.viewport.getBoundingClientRect();
-                const x = Math.floor((clientX - rect.left) / this.scale);
-                const y = Math.floor((clientY - rect.top) / this.scale);
+                // Также используем математику смещения для взаимодействия
+                const x = Math.floor((clientX - this.offsetX) / this.scale);
+                const y = Math.floor((clientY - this.offsetY) / this.scale);
 
                 if (x >= 0 && x < this.canvas.width && y >= 0 && y < this.canvas.height) {
                     this.app.placePixel(x, y);
@@ -563,15 +641,15 @@
                 const btnCancel = document.getElementById('btn-admin-cancel');
                 const input = document.getElementById('admin-password-input');
                 const errorText = document.getElementById('admin-auth-error');
-                
+
                 modal.classList.remove('hidden');
                 modal.classList.add('flex');
-                
+
                 const attemptLogin = async () => {
                     btnLogin.disabled = true;
                     btnLogin.innerText = "Проверка...";
                     const response = await this.app.network.authenticateAdmin(input.value);
-                    
+
                     if (response.success) {
                         modal.classList.remove('flex');
                         modal.classList.add('hidden');
@@ -588,7 +666,7 @@
 
                 btnLogin.onclick = attemptLogin;
                 input.onkeydown = (e) => { if (e.key === 'Enter') attemptLogin(); };
-                
+
                 btnCancel.onclick = () => {
                     modal.classList.remove('flex');
                     modal.classList.add('hidden');
@@ -603,7 +681,7 @@
                     btn.className = 'color-btn snap-center shrink-0';
                     btn.style.backgroundColor = color;
                     if (color === this.currentColor) btn.classList.add('active');
-                    
+
                     btn.onclick = () => {
                         document.querySelectorAll('.color-btn').forEach(b => b.classList.remove('active'));
                         btn.classList.add('active');
@@ -630,15 +708,15 @@
                 this.lastPlacedTime = Date.now();
                 const box = document.getElementById('cooldown-box');
                 const timerText = document.getElementById('cooldown-timer');
-                
+
                 box.classList.remove('hidden');
                 box.classList.add('flex');
-                
+
                 clearInterval(this.cooldownInterval);
                 this.cooldownInterval = setInterval(() => {
                     const elapsed = Math.floor((Date.now() - this.lastPlacedTime) / 1000);
                     const remaining = this.app.settings.cooldown - elapsed;
-                    
+
                     if (remaining <= 0) {
                         clearInterval(this.cooldownInterval);
                         box.classList.add('hidden');
@@ -663,9 +741,9 @@
                     const newCd = parseInt(document.getElementById('admin-cooldown').value);
                     const newGrid = document.getElementById('admin-grid').checked;
                     const newBg = document.getElementById('admin-bg-color').value;
-                    this.app.network.updateSettings({ 
-                        canvas_size: newSize, 
-                        cooldown: newCd, 
+                    this.app.network.updateSettings({
+                        canvas_size: newSize,
+                        cooldown: newCd,
                         grid_enabled: newGrid,
                         bg_color: newBg
                     });
@@ -684,7 +762,7 @@
                 if (!this.isAdmin) return;
                 const log = document.getElementById('admin-log');
                 const li = document.createElement('li');
-                li.innerHTML = `<span style="color:${color}; text-shadow: 0 0 1px black;">■</span> [${x},${y}] by ${uid.substr(0,6)}...`;
+                li.innerHTML = `<span style="color:${color}; text-shadow: 0 0 1px black;">■</span> [${x},${y}] by ${uid.substr(0, 6)}...`;
                 log.prepend(li);
                 if (log.children.length > 50) log.removeChild(log.lastChild);
             }
@@ -722,7 +800,7 @@
             constructor() {
                 this.userId = Utils.getUserId();
                 this.settings = { ...AppConfig.DEFAULT_SETTINGS };
-                
+
                 this.uiManager = new UIManager(this);
                 this.canvasManager = new CanvasManager(this);
                 this.network = new NetworkService(this);
@@ -732,8 +810,8 @@
                 if (!newSettings) return;
                 this.settings = newSettings;
                 this.canvasManager.applySettings(
-                    this.settings.canvas_size, 
-                    this.settings.grid_enabled, 
+                    this.settings.canvas_size,
+                    this.settings.grid_enabled,
                     this.settings.bg_color
                 );
                 this.uiManager.updateAdminInputs(this.settings);
@@ -742,13 +820,13 @@
             async placePixel(x, y) {
                 if (!this.uiManager.canPlacePixel()) return;
                 const color = this.uiManager.currentColor;
-                
+
                 this.canvasManager.showHighlight(x, y, color);
                 const confirmed = await this.uiManager.showActionPanel(x, y, color);
                 this.canvasManager.hideHighlight();
 
                 if (!confirmed) return;
-                
+
                 this.canvasManager.drawPixel(x, y, color);
                 this.uiManager.startCooldown();
 
@@ -761,767 +839,5 @@
         };
     </script>
 </body>
-</html>
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <!-- Адаптивный viewport с поддержкой вырезов (safe-area) на современных смартфонах -->
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>Pixel Battle | Self-Hosted</title>
-    <script src="tailwindcss.js"></script>
-    <script src="socket.io.min.js"></script>
-    <style>
-        /* Запрещаем скролл браузера, выделение текста и pull-to-refresh на мобильных */
-        body { 
-            margin: 0; 
-            overflow: hidden; 
-            background-color: #1f2937; 
-            touch-action: none; 
-            overscroll-behavior: none;
-            -webkit-user-select: none;
-            user-select: none;
-            -webkit-touch-callout: none;
-        }
-        
-        #canvas-container { width: 100vw; height: 100vh; position: relative; cursor: crosshair; }
-        #pixelCanvas { position: absolute; transform-origin: 0 0; image-rendering: pixelated; box-shadow: 0 0 20px rgba(0,0,0,0.5); }
-        #grid-layer { position: absolute; transform-origin: 0 0; pointer-events: none; }
-        #selection-cursor {
-            position: absolute; pointer-events: none; border: 2px solid white; box-shadow: 0 0 4px black;
-            box-sizing: border-box; display: none; z-index: 10;
-        }
-        
-        /* Инструменты */
-        .color-btn { 
-            flex: 0 0 auto;
-            width: 32px; height: 32px; 
-            border-radius: 6px; cursor: pointer; 
-            transition: transform 0.1s, border 0.1s; 
-            border: 2px solid transparent; 
-            box-shadow: 0 2px 4px rgba(0,0,0,0.3);
-        }
-        @media (min-width: 640px) {
-            .color-btn { width: 36px; height: 36px; }
-        }
-        .color-btn.active { transform: scale(1.15); border-color: white; z-index: 2;}
-        
-        /* Скрываем скроллбар для горизонтальной палитры на мобильных */
-        .hide-scrollbar::-webkit-scrollbar { display: none; }
-        .hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
-        
-        /* Модальное окно */
-        #custom-modal { display: none; background: rgba(0,0,0,0.7); backdrop-filter: blur(4px); }
-        #custom-modal.flex { display: flex; }
 
-        /* Учет Safe Areas для iOS/Android */
-        .safe-pt { padding-top: max(0.75rem, env(safe-area-inset-top)); }
-        .safe-pb { padding-bottom: max(0.75rem, env(safe-area-inset-bottom)); }
-    </style>
-</head>
-<body class="text-white">
-
-    <!-- ВЕРХНЯЯ ПАНЕЛЬ -->
-    <div class="fixed top-0 left-0 w-full bg-gray-900/90 backdrop-blur border-b border-gray-700 px-3 safe-pt pb-3 flex justify-between items-center z-20 shadow-lg">
-        <div class="font-bold text-lg sm:text-xl flex items-center gap-2">
-            <div><span class="text-blue-400">Pixel</span><span class="hidden sm:inline">Battle</span></div>
-            <div id="connection-status" class="w-3 h-3 rounded-full bg-red-500 animate-pulse shadow-[0_0_8px_rgba(239,68,68,0.8)]" title="Подключение к серверу..."></div>
-        </div>
-        <div class="flex items-center gap-2 sm:gap-4 text-xs sm:text-sm">
-            <div class="text-gray-400 flex items-center gap-1">
-                <span class="hidden sm:inline">Ваш ID:</span> 
-                <span id="user-info" class="text-white font-mono bg-gray-800 px-2 py-1 rounded truncate max-w-[80px] sm:max-w-[120px]">...</span>
-            </div>
-            <div id="cooldown-box" class="hidden items-center gap-1 sm:gap-2 bg-gray-800 border border-gray-700 px-2 sm:px-3 py-1 rounded shadow-inner">
-                <span class="text-gray-400 hidden sm:inline">Ожидание:</span>
-                <span class="text-gray-400 sm:hidden">⏳</span>
-                <span id="cooldown-timer" class="font-bold text-red-400">0s</span>
-            </div>
-        </div>
-    </div>
-
-    <!-- КОНТЕЙНЕР ХОЛСТА -->
-    <div id="canvas-container" class="relative overflow-hidden w-screen h-screen">
-        <div id="canvas-viewport" class="absolute top-0 left-0" style="transform-origin: 0 0;">
-            <canvas id="pixelCanvas" class="absolute top-0 left-0" style="image-rendering: pixelated;"></canvas>
-            <canvas id="grid-layer" class="absolute top-0 left-0 pointer-events-none"></canvas>
-            <div id="selection-cursor" class="absolute pointer-events-none border-white shadow-[0_0_2px_black] z-10 box-border hidden" style="border-width: 1px;"></div>
-            <div id="active-pixel-highlight" class="absolute pointer-events-none border-white shadow-[0_0_10px_rgba(255,255,255,0.8)] z-10 box-border hidden" style="border-width: 1px;"></div>
-        </div>
-    </div>
-
-    <!-- НИЖНЯЯ ПАНЕЛЬ ИНСТРУМЕНТОВ -->
-    <div class="fixed bottom-2 sm:bottom-4 left-1/2 transform -translate-x-1/2 bg-gray-800/95 backdrop-blur px-3 safe-pb pt-3 rounded-2xl shadow-2xl border border-gray-600 flex flex-col items-center gap-3 z-20 w-[96%] max-w-md sm:max-w-lg transition-all">
-        <!-- Палитра (Скроллится по горизонтали на смартфонах) -->
-        <div id="color-palette" class="flex gap-2 overflow-x-auto w-full pb-2 hide-scrollbar snap-x sm:flex-wrap sm:justify-center px-1"></div>
-        
-        <!-- Управление зумом -->
-        <div class="flex gap-3 items-center w-full justify-between sm:justify-center px-2">
-            <button id="btn-zoom-out" class="w-12 h-10 sm:w-auto sm:px-4 bg-gray-700 hover:bg-gray-600 active:bg-gray-500 rounded-lg shadow border border-gray-600 font-bold text-lg flex items-center justify-center transition-colors">
-                - <span class="hidden sm:inline ml-1 text-sm font-normal">Зум</span>
-            </button>
-            <button id="btn-center" class="bg-gray-700 hover:bg-gray-600 active:bg-gray-500 px-3 py-1 rounded-lg border border-gray-600 text-xs font-bold transition-colors">
-                Центр
-            </button>
-            <span id="zoom-level" class="text-xs sm:text-sm text-gray-400 font-mono font-bold bg-gray-900 px-3 py-1 rounded-full border border-gray-700 shadow-inner">100%</span>
-            <button id="btn-zoom-in" class="w-12 h-10 sm:w-auto sm:px-4 bg-gray-700 hover:bg-gray-600 active:bg-gray-500 rounded-lg shadow border border-gray-600 font-bold text-lg flex items-center justify-center transition-colors">
-                + <span class="hidden sm:inline ml-1 text-sm font-normal">Зум</span>
-            </button>
-        </div>
-    </div>
-
-    <!-- ПАНЕЛЬ ПОДТВЕРЖДЕНИЯ (Floating Action Panel) -->
-    <div id="action-panel" class="hidden fixed bottom-24 left-1/2 transform -translate-x-1/2 bg-gray-900/95 backdrop-blur-md px-4 py-3 rounded-2xl shadow-2xl border border-blue-500/50 flex items-center gap-4 z-40 w-[90%] max-w-xs transition-all animate-in fade-in slide-in-from-bottom-4">
-        <div class="flex-1">
-            <div class="text-[10px] text-gray-400 uppercase font-bold tracking-wider">Пиксель</div>
-            <div id="action-info" class="text-sm font-mono font-bold flex items-center gap-2">
-                <span id="action-coords" class="text-white">[0, 0]</span>
-                <span id="action-color-preview" class="w-3 h-3 rounded-full border border-white/20"></span>
-            </div>
-        </div>
-        <div class="flex gap-2">
-            <button id="btn-action-cancel" class="p-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition-colors">
-                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
-                    <path fill-rule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clip-rule="evenodd" />
-                </svg>
-            </button>
-            <button id="btn-action-confirm" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 active:bg-blue-700 rounded-lg font-bold text-sm shadow-lg shadow-blue-500/20 transition-all flex items-center gap-2">
-                ОК
-            </button>
-        </div>
-    </div>
-
-    <!-- АДМИН ПАНЕЛЬ (Адаптивная) -->
-    <div id="admin-panel" class="hidden fixed top-20 right-2 sm:right-4 bg-gray-800 border border-red-500/50 p-4 rounded-xl shadow-2xl z-30 w-[calc(100vw-1rem)] sm:w-80 max-h-[70vh] overflow-y-auto flex-col gap-4">
-        <div class="flex justify-between items-center border-b border-gray-700 pb-2">
-            <h2 class="text-red-400 font-bold text-lg">⚙️ Admin Panel</h2>
-        </div>
-        
-        <div class="bg-gray-900 p-3 rounded border border-gray-700">
-            <h3 class="text-sm text-gray-400 mb-2">Настройки холста</h3>
-            <label class="block text-xs mb-1">Размер (px):</label>
-            <input type="number" id="admin-size" class="w-full bg-gray-800 p-2 rounded text-white border border-gray-600 mb-2 focus:border-blue-500 outline-none transition" min="10" max="1000">
-            
-            <label class="block text-xs mb-1">Ожидание (сек):</label>
-            <input type="number" id="admin-cooldown" class="w-full bg-gray-800 p-2 rounded text-white border border-gray-600 mb-2 focus:border-blue-500 outline-none transition" min="0" max="60">
-            
-            <label class="block text-xs mb-1">Цвет фона:</label>
-            <input type="color" id="admin-bg-color" class="w-full h-10 bg-gray-800 rounded border border-gray-600 mb-3 cursor-pointer">
-
-            <label class="flex items-center gap-2 text-sm cursor-pointer mb-3 select-none">
-                <input type="checkbox" id="admin-grid" class="w-4 h-4 rounded accent-blue-500">
-                Отображать сетку
-            </label>
-            <button id="btn-save-settings" class="w-full bg-blue-600 hover:bg-blue-500 active:bg-blue-700 py-2 rounded font-bold shadow transition">Сохранить для всех</button>
-        </div>
-
-        <button id="btn-nuke" class="w-full bg-red-600 hover:bg-red-500 active:bg-red-700 text-white font-bold py-2 px-4 rounded shadow transition border border-red-400">
-            💥 ОЧИСТИТЬ ХОЛСТ
-        </button>
-
-        <div class="bg-gray-900 p-3 rounded border border-gray-700 mt-2">
-            <h3 class="text-sm text-gray-400 mb-2">Лог действий:</h3>
-            <ul id="admin-log" class="text-xs font-mono text-gray-300 space-y-1 h-32 overflow-y-auto hide-scrollbar"></ul>
-        </div>
-    </div>
-
-    <!-- ОКНО АВТОРИЗАЦИИ АДМИНА -->
-    <div id="admin-auth-modal" class="hidden fixed inset-0 z-50 justify-center items-center bg-black/80 backdrop-blur-sm">
-        <div class="bg-gray-800 border border-red-500/50 p-6 rounded-xl shadow-2xl w-[90%] max-w-sm mx-auto">
-            <h3 class="text-xl font-bold mb-4 text-red-400">Вход в систему</h3>
-            <input type="password" id="admin-password-input" class="w-full bg-gray-900 p-3 rounded text-white border border-gray-600 mb-2 focus:border-red-500 outline-none" placeholder="Введите пароль админа">
-            <p id="admin-auth-error" class="text-red-500 text-sm mb-4 min-h-[1.25rem]"></p>
-            <div class="flex justify-end gap-3">
-                <button id="btn-admin-cancel" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded transition font-medium">Закрыть</button>
-                <button id="btn-admin-login" class="px-4 py-2 bg-red-600 hover:bg-red-500 rounded font-bold shadow transition">Войти</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- МОДАЛЬНОЕ ОКНО -->
-    <div id="custom-modal" class="fixed inset-0 z-50 justify-center items-center">
-        <div class="bg-gray-800 border border-gray-600 p-6 rounded-xl shadow-2xl w-[90%] max-w-sm mx-auto transform transition-all scale-100">
-            <h3 id="modal-title" class="text-xl font-bold mb-2">Внимание</h3>
-            <p id="modal-desc" class="text-gray-300 mb-6 text-sm sm:text-base">Вы уверены?</p>
-            <div class="flex justify-end gap-3">
-                <button id="btn-modal-cancel" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 active:bg-gray-500 rounded transition font-medium">Отмена</button>
-                <button id="btn-modal-confirm" class="px-4 py-2 bg-red-600 hover:bg-red-500 active:bg-red-700 rounded font-bold shadow transition">Да</button>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        // === ООП АРХИТЕКТУРА ===
-
-        class AppConfig {
-            static COLORS = [
-                '#000000', '#1a1c2c', '#5d275d', '#b13e53', '#ef7d57', '#ffcd75', '#a7f070', '#38b764',
-                '#257179', '#29366f', '#3b5dc9', '#41a6f6', '#73eff7', '#f4f4f4', '#94b0c2', '#566c86'
-            ];
-            static DEFAULT_SETTINGS = { canvas_size: 50, cooldown: 2, grid_enabled: true, bg_color: '#1f2937' };
-        }
-
-        class Utils {
-            static getUserId() {
-                let id = localStorage.getItem('pixel_user_id');
-                if (!id) {
-                    id = 'user_' + Math.random().toString(36).substr(2, 9);
-                    localStorage.setItem('pixel_user_id', id);
-                }
-                return id;
-            }
-
-            static confirm(title, desc) {
-                return new Promise((resolve) => {
-                    const modal = document.getElementById('custom-modal');
-                    document.getElementById('modal-title').innerText = title;
-                    document.getElementById('modal-desc').innerText = desc;
-                    modal.classList.add('flex');
-
-                    const onConfirm = () => { cleanup(); resolve(true); };
-                    const onCancel = () => { cleanup(); resolve(false); };
-
-                    const btnConfirm = document.getElementById('btn-modal-confirm');
-                    const btnCancel = document.getElementById('btn-modal-cancel');
-
-                    btnConfirm.addEventListener('click', onConfirm);
-                    btnCancel.addEventListener('click', onCancel);
-
-                    function cleanup() {
-                        modal.classList.remove('flex');
-                        btnConfirm.removeEventListener('click', onConfirm);
-                        btnCancel.removeEventListener('click', onCancel);
-                    }
-                });
-            }
-        }
-
-        class NetworkService {
-            constructor(app) {
-                this.app = app;
-                this.socket = io(); 
-
-                const statusIndicator = document.getElementById('connection-status');
-
-                this.socket.on('connect', () => {
-                    console.log('Подключено к серверу');
-                    statusIndicator.classList.remove('bg-red-500', 'animate-pulse', 'shadow-[0_0_8px_rgba(239,68,68,0.8)]');
-                    statusIndicator.classList.add('bg-green-500', 'shadow-[0_0_8px_rgba(34,197,94,0.8)]');
-                    statusIndicator.title = "Подключено";
-                });
-
-                this.socket.on('disconnect', () => {
-                    statusIndicator.classList.add('bg-red-500', 'animate-pulse', 'shadow-[0_0_8px_rgba(239,68,68,0.8)]');
-                    statusIndicator.classList.remove('bg-green-500', 'shadow-[0_0_8px_rgba(34,197,94,0.8)]');
-                    statusIndicator.title = "Потеряно соединение";
-                });
-
-                this.socket.on('init_data', (data) => {
-                    this.app.updateSettings(data.settings);
-                    this.app.canvasManager.loadPixels(data.pixels);
-                });
-
-                this.socket.on('pixel_update', (pixel) => {
-                    this.app.canvasManager.drawPixel(pixel.x, pixel.y, pixel.color);
-                    this.app.uiManager.logAction(pixel.x, pixel.y, pixel.color, pixel.userId);
-                });
-
-                this.socket.on('settings_updated', (settings) => {
-                    this.app.updateSettings(settings);
-                });
-
-                this.socket.on('canvas_cleared', () => {
-                    this.app.canvasManager.clearLocalCanvas();
-                });
-            }
-
-            authenticateAdmin(password) {
-                return new Promise((resolve) => {
-                    this.socket.emit('admin_auth', password, (response) => resolve(response));
-                });
-            }
-
-            sendPixel(x, y, color, userId) {
-                this.socket.emit('set_pixel', { x, y, color, userId });
-            }
-
-            clearCanvas() {
-                this.socket.emit('clear_canvas');
-            }
-
-            updateSettings(settings) {
-                this.socket.emit('update_settings', settings);
-            }
-        }
-
-        class CanvasManager {
-            constructor(app) {
-                this.app = app;
-                this.container = document.getElementById('canvas-container');
-                this.viewport = document.getElementById('canvas-viewport');
-                this.canvas = document.getElementById('pixelCanvas');
-                this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
-                this.gridCanvas = document.getElementById('grid-layer');
-                this.gridCtx = this.gridCanvas.getContext('2d');
-                this.cursor = document.getElementById('selection-cursor');
-                this.highlight = document.getElementById('active-pixel-highlight');
-                
-                this.pixelsMap = new Map();
-                this.highlightedPixel = null;
-
-                this.scale = 20;
-                this.offsetX = 0;
-                this.offsetY = 0;
-                this.isDragging = false;
-                this.dragStart = { x: 0, y: 0 };
-
-                this.setupEvents();
-                this.centerCanvas();
-            }
-
-            applySettings(size, gridEnabled, bgColor) {
-                if (this.canvas.width !== size) {
-                    this.canvas.width = size;
-                    this.canvas.height = size;
-                    this.gridCanvas.width = size;
-                    this.gridCanvas.height = size;
-                    this.centerCanvas();
-                }
-                this.app.settings.grid_enabled = gridEnabled;
-                if (bgColor) {
-                    document.body.style.backgroundColor = bgColor;
-                    this.app.settings.bg_color = bgColor;
-                }
-                this.updateTransform();
-            }
-
-            loadPixels(pixelsArray) {
-                this.clearLocalCanvas(false);
-                pixelsArray.forEach(p => {
-                    this.pixelsMap.set(`${p.x},${p.y}`, p.color);
-                    this.drawRawPixel(p.x, p.y, p.color);
-                });
-            }
-
-            drawPixel(x, y, color) {
-                this.pixelsMap.set(`${x},${y}`, color);
-                this.drawRawPixel(x, y, color);
-            }
-
-            drawRawPixel(x, y, color) {
-                if (x >= 0 && x < this.canvas.width && y >= 0 && y < this.canvas.height) {
-                    this.ctx.fillStyle = color;
-                    this.ctx.fillRect(x, y, 1, 1);
-                }
-            }
-
-            clearLocalCanvas(clearMap = true) {
-                if (clearMap) this.pixelsMap.clear();
-                this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-            }
-
-            centerCanvas() {
-                this.offsetX = (window.innerWidth - (this.canvas.width * this.scale)) / 2;
-                this.offsetY = (window.innerHeight - (this.canvas.height * this.scale)) / 2;
-                this.updateTransform();
-            }
-
-            updateTransform() {
-                this.viewport.style.transform = `translate(${this.offsetX}px, ${this.offsetY}px) scale(${this.scale})`;
-                this.drawGrid();
-                this.updateHighlightPosition();
-            }
-
-            updateHighlightPosition() {
-                if (this.highlightedPixel) {
-                    const { x, y } = this.highlightedPixel;
-                    this.highlight.style.width = `1px`;
-                    this.highlight.style.height = `1px`;
-                    this.highlight.style.left = `${x}px`;
-                    this.highlight.style.top = `${y}px`;
-                    this.highlight.style.borderWidth = `${1 / this.scale}px`;
-                }
-            }
-
-            showHighlight(x, y, color) {
-                this.highlightedPixel = { x, y, color };
-                this.highlight.style.borderColor = color === '#f4f4f4' ? '#000' : '#fff';
-                this.highlight.classList.remove('hidden');
-                this.updateHighlightPosition();
-            }
-
-            hideHighlight() {
-                this.highlightedPixel = null;
-                this.highlight.classList.add('hidden');
-            }
-
-            drawGrid() {
-                this.gridCtx.clearRect(0, 0, this.gridCanvas.width, this.gridCanvas.height);
-                if (!this.app.settings.grid_enabled || this.scale < 5) return;
-
-                this.gridCtx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
-                this.gridCtx.lineWidth = 1 / this.scale;
-                this.gridCtx.beginPath();
-                for (let x = 0; x <= this.gridCanvas.width; x++) {
-                    this.gridCtx.moveTo(x, 0); this.gridCtx.lineTo(x, this.gridCanvas.height);
-                }
-                for (let y = 0; y <= this.gridCanvas.height; y++) {
-                    this.gridCtx.moveTo(0, y); this.gridCtx.lineTo(this.gridCanvas.width, y);
-                }
-                this.gridCtx.stroke();
-            }
-
-            updateCursor(clientX, clientY) {
-                const rect = this.viewport.getBoundingClientRect();
-                const x = Math.floor((clientX - rect.left) / this.scale);
-                const y = Math.floor((clientY - rect.top) / this.scale);
-
-                const isTouchDevice = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
-
-                if (!isTouchDevice && x >= 0 && x < this.canvas.width && y >= 0 && y < this.canvas.height) {
-                    this.cursor.style.display = 'block';
-                    this.cursor.style.width = `1px`;
-                    this.cursor.style.height = `1px`;
-                    this.cursor.style.left = `${x}px`;
-                    this.cursor.style.top = `${y}px`;
-                    this.cursor.style.borderWidth = `${1 / this.scale}px`;
-                    this.cursor.style.borderColor = this.app.uiManager.currentColor;
-                } else {
-                    this.cursor.style.display = 'none';
-                }
-            }
-
-            zoom(delta) {
-                const oldScale = this.scale;
-                this.scale += delta;
-                this.scale = Math.max(0.5, Math.min(this.scale, 80));
-                
-                const cx = window.innerWidth / 2;
-                const cy = window.innerHeight / 2;
-                
-                this.offsetX = cx - (cx - this.offsetX) * (this.scale / oldScale);
-                this.offsetY = cy - (cy - this.offsetY) * (this.scale / oldScale);
-                
-                this.updateTransform();
-                this.app.uiManager.updateZoomText(this.scale);
-            }
-
-            setupEvents() {
-                window.addEventListener('resize', () => {
-                    this.centerCanvas();
-                });
-                
-                document.getElementById('btn-zoom-in').addEventListener('click', () => this.zoom(this.scale * 0.3));
-                document.getElementById('btn-zoom-out').addEventListener('click', () => this.zoom(-(this.scale * 0.3)));
-                document.getElementById('btn-center').addEventListener('click', () => this.centerCanvas());
-
-                this.container.addEventListener('wheel', (e) => {
-                    e.preventDefault();
-                    const delta = e.deltaY > 0 ? -(this.scale * 0.15) : (this.scale * 0.15);
-                    this.zoom(delta);
-                    this.updateCursor(e.clientX, e.clientY);
-                }, { passive: false });
-
-                this.container.addEventListener('mousemove', (e) => {
-                    if (this.isDragging) {
-                        this.offsetX += e.clientX - this.dragStart.x;
-                        this.offsetY += e.clientY - this.dragStart.y;
-                        this.dragStart = { x: e.clientX, y: e.clientY };
-                        this.updateTransform();
-                    }
-                    this.updateCursor(e.clientX, e.clientY);
-                });
-
-                this.container.addEventListener('mousedown', (e) => {
-                    if (e.button === 1 || (e.button === 0 && (e.shiftKey || e.ctrlKey))) { 
-                        this.isDragging = true;
-                        this.dragStart = { x: e.clientX, y: e.clientY };
-                        this.container.style.cursor = 'grabbing';
-                    } else if (e.button === 0) {
-                        this.handleInteraction(e.clientX, e.clientY);
-                    }
-                });
-
-                window.addEventListener('mouseup', () => {
-                    this.isDragging = false;
-                    this.container.style.cursor = 'crosshair';
-                });
-
-                let initialPinchDistance = null;
-                
-                this.container.addEventListener('touchstart', (e) => {
-                    if (e.touches.length === 1) {
-                        this.dragStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
-                    } else if (e.touches.length === 2) {
-                        initialPinchDistance = Math.hypot(
-                            e.touches[0].clientX - e.touches[1].clientX,
-                            e.touches[0].clientY - e.touches[1].clientY
-                        );
-                    }
-                }, {passive: false});
-
-                this.container.addEventListener('touchmove', (e) => {
-                    e.preventDefault(); 
-                    if (e.touches.length === 1 && this.dragStart) {
-                        this.offsetX += e.touches[0].clientX - this.dragStart.x;
-                        this.offsetY += e.touches[0].clientY - this.dragStart.y;
-                        this.dragStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
-                        this.updateTransform();
-                    } else if (e.touches.length === 2 && initialPinchDistance) {
-                        const currentDist = Math.hypot(
-                            e.touches[0].clientX - e.touches[1].clientX,
-                            e.touches[0].clientY - e.touches[1].clientY
-                        );
-                        const zoomSpeed = this.scale * 0.015;
-                        this.zoom((currentDist - initialPinchDistance) * zoomSpeed);
-                        initialPinchDistance = currentDist;
-                    }
-                }, {passive: false});
-
-                this.container.addEventListener('touchend', (e) => {
-                    if (e.changedTouches.length === 1 && !initialPinchDistance) {
-                        const dx = Math.abs(e.changedTouches[0].clientX - this.dragStart.x);
-                        const dy = Math.abs(e.changedTouches[0].clientY - this.dragStart.y);
-                        if (dx < 10 && dy < 10) {
-                            this.handleInteraction(e.changedTouches[0].clientX, e.changedTouches[0].clientY);
-                        }
-                    }
-                    if (e.touches.length < 2) {
-                        initialPinchDistance = null;
-                    }
-                });
-            }
-
-            handleInteraction(clientX, clientY) {
-                const rect = this.viewport.getBoundingClientRect();
-                const x = Math.floor((clientX - rect.left) / this.scale);
-                const y = Math.floor((clientY - rect.top) / this.scale);
-
-                if (x >= 0 && x < this.canvas.width && y >= 0 && y < this.canvas.height) {
-                    this.app.placePixel(x, y);
-                }
-            }
-        }
-
-        class UIManager {
-            constructor(app) {
-                this.app = app;
-                this.currentColor = AppConfig.COLORS[0];
-                this.lastPlacedTime = 0;
-                this.cooldownInterval = null;
-                this.isAdmin = false;
-                this.isAdminViewRequested = new URLSearchParams(window.location.search).get('view') === 'admin';
-
-                this.buildPalette();
-                document.getElementById('user-info').innerText = this.app.userId;
-
-                if (this.isAdminViewRequested) {
-                    this.showAdminAuth();
-                }
-            }
-
-            showAdminAuth() {
-                const modal = document.getElementById('admin-auth-modal');
-                const btnLogin = document.getElementById('btn-admin-login');
-                const btnCancel = document.getElementById('btn-admin-cancel');
-                const input = document.getElementById('admin-password-input');
-                const errorText = document.getElementById('admin-auth-error');
-                
-                modal.classList.remove('hidden');
-                modal.classList.add('flex');
-                
-                const attemptLogin = async () => {
-                    btnLogin.disabled = true;
-                    btnLogin.innerText = "Проверка...";
-                    const response = await this.app.network.authenticateAdmin(input.value);
-                    
-                    if (response.success) {
-                        modal.classList.remove('flex');
-                        modal.classList.add('hidden');
-                        this.isAdmin = true;
-                        this.initAdminPanel();
-                        this.updateAdminInputs(this.app.settings);
-                    } else {
-                        errorText.innerText = response.message;
-                        btnLogin.disabled = false;
-                        btnLogin.innerText = "Войти";
-                        input.value = '';
-                    }
-                };
-
-                btnLogin.onclick = attemptLogin;
-                input.onkeydown = (e) => { if (e.key === 'Enter') attemptLogin(); };
-                
-                btnCancel.onclick = () => {
-                    modal.classList.remove('flex');
-                    modal.classList.add('hidden');
-                    window.history.replaceState({}, document.title, window.location.pathname); // Убираем параметр из URL
-                };
-            }
-
-            buildPalette() {
-                const container = document.getElementById('color-palette');
-                AppConfig.COLORS.forEach(color => {
-                    const btn = document.createElement('button');
-                    btn.className = 'color-btn snap-center shrink-0';
-                    btn.style.backgroundColor = color;
-                    if (color === this.currentColor) btn.classList.add('active');
-                    
-                    btn.onclick = () => {
-                        document.querySelectorAll('.color-btn').forEach(b => b.classList.remove('active'));
-                        btn.classList.add('active');
-                        this.currentColor = color;
-                        // Слегка скроллим к выбранному цвету на смартфонах
-                        btn.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
-                    };
-                    container.appendChild(btn);
-                });
-            }
-
-            updateZoomText(scale) {
-                document.getElementById('zoom-level').innerText = `${Math.round((scale / 20) * 100)}%`;
-            }
-
-            canPlacePixel() {
-                if (this.isAdmin) return true;
-                const now = Date.now();
-                return (now - this.lastPlacedTime) >= (this.app.settings.cooldown * 1000);
-            }
-
-            startCooldown() {
-                if (this.isAdmin) return;
-                this.lastPlacedTime = Date.now();
-                const box = document.getElementById('cooldown-box');
-                const timerText = document.getElementById('cooldown-timer');
-                
-                box.classList.remove('hidden');
-                box.classList.add('flex');
-                
-                clearInterval(this.cooldownInterval);
-                this.cooldownInterval = setInterval(() => {
-                    const elapsed = Math.floor((Date.now() - this.lastPlacedTime) / 1000);
-                    const remaining = this.app.settings.cooldown - elapsed;
-                    
-                    if (remaining <= 0) {
-                        clearInterval(this.cooldownInterval);
-                        box.classList.add('hidden');
-                        box.classList.remove('flex');
-                    } else {
-                        timerText.innerText = `${remaining}s`;
-                    }
-                }, 100);
-            }
-
-            initAdminPanel() {
-                document.getElementById('admin-panel').classList.remove('hidden');
-                document.getElementById('admin-panel').classList.add('flex');
-
-                document.getElementById('btn-nuke').onclick = async () => {
-                    const confirmed = await Utils.confirm("Очистка холста", "Вы точно хотите удалить все пиксели навсегда?");
-                    if (confirmed) this.app.network.clearCanvas();
-                };
-
-                document.getElementById('btn-save-settings').onclick = () => {
-                    const newSize = parseInt(document.getElementById('admin-size').value);
-                    const newCd = parseInt(document.getElementById('admin-cooldown').value);
-                    const newGrid = document.getElementById('admin-grid').checked;
-                    const newBg = document.getElementById('admin-bg-color').value;
-                    this.app.network.updateSettings({ 
-                        canvas_size: newSize, 
-                        cooldown: newCd, 
-                        grid_enabled: newGrid,
-                        bg_color: newBg
-                    });
-                };
-            }
-
-            updateAdminInputs(settings) {
-                if (!this.isAdmin) return;
-                document.getElementById('admin-size').value = settings.canvas_size;
-                document.getElementById('admin-cooldown').value = settings.cooldown;
-                document.getElementById('admin-grid').checked = settings.grid_enabled;
-                document.getElementById('admin-bg-color').value = settings.bg_color || '#1f2937';
-            }
-
-            logAction(x, y, color, uid) {
-                if (!this.isAdmin) return;
-                const log = document.getElementById('admin-log');
-                const li = document.createElement('li');
-                li.innerHTML = `<span style="color:${color}; text-shadow: 0 0 1px black;">■</span> [${x},${y}] by ${uid.substr(0,6)}...`;
-                log.prepend(li);
-                if (log.children.length > 50) log.removeChild(log.lastChild);
-            }
-
-            showActionPanel(x, y, color) {
-                return new Promise((resolve) => {
-                    const panel = document.getElementById('action-panel');
-                    const info = document.getElementById('action-coords');
-                    const preview = document.getElementById('action-color-preview');
-                    const btnConfirm = document.getElementById('btn-action-confirm');
-                    const btnCancel = document.getElementById('btn-action-cancel');
-
-                    info.innerText = `[${x}, ${y}]`;
-                    preview.style.backgroundColor = color;
-                    panel.classList.remove('hidden');
-                    panel.classList.add('flex');
-
-                    const onConfirm = () => { cleanup(); resolve(true); };
-                    const onCancel = () => { cleanup(); resolve(false); };
-
-                    btnConfirm.onclick = onConfirm;
-                    btnCancel.onclick = onCancel;
-
-                    function cleanup() {
-                        panel.classList.remove('flex');
-                        panel.classList.add('hidden');
-                        btnConfirm.onclick = null;
-                        btnCancel.onclick = null;
-                    }
-                });
-            }
-        }
-
-        class App {
-            constructor() {
-                this.userId = Utils.getUserId();
-                this.settings = { ...AppConfig.DEFAULT_SETTINGS };
-                
-                this.uiManager = new UIManager(this);
-                this.canvasManager = new CanvasManager(this);
-                this.network = new NetworkService(this);
-            }
-
-            updateSettings(newSettings) {
-                if (!newSettings) return;
-                this.settings = newSettings;
-                this.canvasManager.applySettings(
-                    this.settings.canvas_size, 
-                    this.settings.grid_enabled, 
-                    this.settings.bg_color
-                );
-                this.uiManager.updateAdminInputs(this.settings);
-            }
-
-            async placePixel(x, y) {
-                if (!this.uiManager.canPlacePixel()) return;
-                const color = this.uiManager.currentColor;
-                
-                this.canvasManager.showHighlight(x, y, color);
-                const confirmed = await this.uiManager.showActionPanel(x, y, color);
-                this.canvasManager.hideHighlight();
-
-                if (!confirmed) return;
-                
-                this.canvasManager.drawPixel(x, y, color);
-                this.uiManager.startCooldown();
-
-                this.network.sendPixel(x, y, color, this.userId);
-            }
-        }
-
-        window.onload = () => {
-            window.pixelApp = new App();
-        };
-    </script>
-</body>
 </html>
