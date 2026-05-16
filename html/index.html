@@ -5,7 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport"
         content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>Pixel Battle | Self-Hosted</title>
+    <title>Пиксель Баттл ЯКСИТ: Тест 0.1</title>
     <script src="tailwindcss.js"></script>
     <script src="socket.io.min.js"></script>
     <style>
@@ -113,7 +113,7 @@
     <div
         class="fixed top-0 left-0 w-full bg-gray-900/90 backdrop-blur border-b border-gray-700 px-3 safe-pt pb-3 flex justify-between items-center z-20 shadow-lg">
         <div class="font-bold text-lg sm:text-xl flex items-center gap-2">
-            <div><span class="text-blue-400">Pixel</span><span class="hidden sm:inline">Battle</span></div>
+            <div><span class="text-blue-400">Пиксель Баттл</span> ЯКСИТ: Тест 0.1</div>
             <div id="connection-status"
                 class="w-3 h-3 rounded-full bg-red-500 animate-pulse shadow-[0_0_8px_rgba(239,68,68,0.8)]"
                 title="Подключение к серверу..."></div>
@@ -160,6 +160,10 @@
             <button id="btn-center"
                 class="bg-gray-700 hover:bg-gray-600 active:bg-gray-500 px-3 py-1 rounded-lg border border-gray-600 text-xs font-bold transition-colors">
                 Центр
+            </button>
+            <button id="btn-export-png"
+                class="bg-gray-700 hover:bg-gray-600 active:bg-gray-500 px-3 py-1 rounded-lg border border-gray-600 text-xs font-bold transition-colors flex items-center gap-1" title="Скачать как PNG">
+                PNG
             </button>
             <span id="zoom-level"
                 class="text-xs sm:text-sm text-gray-400 font-mono font-bold bg-gray-900 px-3 py-1 rounded-full border border-gray-700 shadow-inner">100%</span>
@@ -220,15 +224,21 @@
                 <input type="checkbox" id="admin-grid" class="w-4 h-4 rounded accent-blue-500">
                 Отображать сетку
             </label>
-            <button id="btn-save-settings"
-                class="w-full bg-blue-600 hover:bg-blue-500 active:bg-blue-700 py-2 rounded font-bold shadow transition">Сохранить
-                для всех</button>
-        </div>
+            <button id="btn-save-settings" class="w-full bg-blue-600 hover:bg-blue-500 active:bg-blue-700 py-2 rounded font-bold shadow transition">Сохранить для всех</button>
+            </div>
 
-        <button id="btn-nuke"
-            class="w-full bg-red-600 hover:bg-red-500 active:bg-red-700 text-white font-bold py-2 px-4 rounded shadow transition border border-red-400">
+            <div class="bg-gray-900 p-3 rounded border border-gray-700">
+            <h3 class="text-sm text-gray-400 mb-2">Бэкап данных</h3>
+            <div class="grid grid-cols-2 gap-2">
+                <button id="btn-export" class="bg-gray-700 hover:bg-gray-600 py-2 rounded text-xs font-bold transition">Экспорт JSON</button>
+                <button id="btn-import" class="bg-gray-700 hover:bg-gray-600 py-2 rounded text-xs font-bold transition">Импорт JSON</button>
+            </div>
+            <input type="file" id="import-file" class="hidden" accept=".json">
+            </div>
+
+            <button id="btn-nuke" class="w-full bg-red-600 hover:bg-red-500 active:bg-red-700 text-white font-bold py-2 px-4 rounded shadow transition border border-red-400">
             💥 ОЧИСТИТЬ ХОЛСТ
-        </button>
+            </button>
 
         <div class="bg-gray-900 p-3 rounded border border-gray-700 mt-2">
             <h3 class="text-sm text-gray-400 mb-2">Лог действий:</h3>
@@ -471,6 +481,25 @@
                 this.highlight.classList.add('hidden');
             }
 
+            exportToPNG() {
+                const tempCanvas = document.createElement('canvas');
+                tempCanvas.width = this.canvas.width;
+                tempCanvas.height = this.canvas.height;
+                const tempCtx = tempCanvas.getContext('2d');
+
+                // Рисуем фон (опционально, если нужно сохранить текущий цвет фона)
+                tempCtx.fillStyle = this.app.settings.bg_color || '#1f2937';
+                tempCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
+
+                // Копируем пиксели с основного холста
+                tempCtx.drawImage(this.canvas, 0, 0);
+
+                const link = document.createElement('a');
+                link.download = `pixel-battle-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
+                link.href = tempCanvas.toDataURL('image/png');
+                link.click();
+            }
+
             drawGrid() {
                 this.gridCtx.clearRect(0, 0, this.gridCanvas.width, this.gridCanvas.height);
                 if (!this.app.settings.grid_enabled || this.scale < 5) return;
@@ -529,6 +558,7 @@
                 document.getElementById('btn-zoom-in').addEventListener('click', () => this.zoom(this.scale * 0.3));
                 document.getElementById('btn-zoom-out').addEventListener('click', () => this.zoom(-(this.scale * 0.3)));
                 document.getElementById('btn-center').addEventListener('click', () => this.centerCanvas());
+                document.getElementById('btn-export-png').addEventListener('click', () => this.exportToPNG());
 
                 this.container.addEventListener('wheel', (e) => {
                     e.preventDefault();
@@ -747,6 +777,54 @@
                         grid_enabled: newGrid,
                         bg_color: newBg
                     });
+                };
+
+                // Экспорт
+                document.getElementById('btn-export').onclick = () => {
+                    this.app.network.socket.emit('export_database', (response) => {
+                        if (response.success) {
+                            const dataStr = JSON.stringify(response, null, 2);
+                            const blob = new Blob([dataStr], { type: 'application/json' });
+                            const url = URL.createObjectURL(blob);
+                            const link = document.createElement('a');
+                            link.href = url;
+                            link.download = `pixel-battle-backup-${new Date().toISOString().split('T')[0]}.json`;
+                            link.click();
+                            URL.revokeObjectURL(url);
+                        } else {
+                            alert(response.message);
+                        }
+                    });
+                };
+
+                // Импорт
+                const importFile = document.getElementById('import-file');
+                document.getElementById('btn-import').onclick = () => importFile.click();
+                
+                importFile.onchange = (e) => {
+                    const file = e.target.files[0];
+                    if (!file) return;
+
+                    const reader = new FileReader();
+                    reader.onload = async (event) => {
+                        try {
+                            const data = JSON.parse(event.target.result);
+                            const confirmed = await Utils.confirm("Импорт данных", "Внимание! Все текущие пиксели будут заменены данными из файла. Продолжить?");
+                            if (confirmed) {
+                                this.app.network.socket.emit('import_database', data, (response) => {
+                                    if (response.success) {
+                                        alert("Импорт успешно завершен!");
+                                    } else {
+                                        alert(response.message);
+                                    }
+                                });
+                            }
+                        } catch (err) {
+                            alert("Ошибка чтения файла: " + err.message);
+                        }
+                        importFile.value = ''; // Сброс инпута
+                    };
+                    reader.readAsText(file);
                 };
             }
 
