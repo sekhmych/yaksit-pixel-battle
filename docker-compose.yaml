@@ -20,14 +20,12 @@ services:
       - db
     restart: unless-stopped
 
-  # Наша база данных PostgreSQL (ДАННЫЕ НЕ СОХРАНЯЮТСЯ ПРИ ПЕРЕЗАПУСКЕ)
+  # Наша база данных PostgreSQL
   db:
     image: postgres:15-alpine
     container_name: pixel-battle-db
     environment:
       POSTGRES_USER: admin
-      POSTGRES_PASSWORD: supersecretpassword # Замените на надежный пароль
+      POSTGRES_PASSWORD: supersecretpassword
       POSTGRES_DB: pixelbattle
-    ports:
-      - "5432:5432"
     restart: unless-stopped

@@ -55,18 +55,27 @@ async function initServer() {
     try {
         const client = await pool.connect();
         console.log("Соединение с БД установлено");
-        client.release();
 
-        // Миграция: добавляем колонку bg_color, если её нет
-        await pool.query("ALTER TABLE settings ADD COLUMN IF NOT EXISTS bg_color VARCHAR(10) DEFAULT '#1f2937'");
+        // Читаем init.sql и выполняем его для создания таблиц
+        const initSqlPath = path.join(__dirname, "init.sql");
+        const fs = require('fs');
+        if (fs.existsSync(initSqlPath)) {
+            const initSql = fs.readFileSync(initSqlPath, 'utf8');
+            await client.query(initSql);
+            console.log("База данных инициализирована (init.sql)");
+        }
+
+        // Миграция: добавляем колонку bg_color, если её нет (на случай если база была создана старой версией)
+        await client.query("ALTER TABLE settings ADD COLUMN IF NOT EXISTS bg_color VARCHAR(10) DEFAULT '#1f2937'");
         
-        const settingsRes = await pool.query(
+        const settingsRes = await client.query(
             "SELECT canvas_size, cooldown, grid_enabled, bg_color FROM settings WHERE id = 1",
         );
         if (settingsRes.rows.length > 0) {
             currentSettings = settingsRes.rows[0];
         }
         console.log("Настройки загружены:", currentSettings);
+        client.release();
     } catch (err) {
         console.error("ОШИБКА ПРИ СТАРТЕ СЕРВЕРА:", err);
     }
