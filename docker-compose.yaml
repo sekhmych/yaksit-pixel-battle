@@ -13,6 +13,7 @@ services:
       - DB_PASSWORD=4>pf4ZR&J4Wp6e
       - DB_NAME=pixel_battle
       - ADMIN_PASSWORD=adminnesosal85780957
+      - PORT=8080
     ports:
-      - "8080:3000"
+      - "8080:8080"
     restart: unless-stopped

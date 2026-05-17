@@ -73,7 +73,10 @@ const pool = new Pool({
     database: process.env.DB_NAME,
     password: process.env.DB_PASSWORD,
     port: process.env.DB_PORT,
+    connectionTimeoutMillis: 5000, // Тайм-аут 5 сек
 });
+
+console.log(`>>> Параметры БД: host=${process.env.DB_HOST}, user=${process.env.DB_USER}, db=${process.env.DB_NAME} <<<`);
 
 // 5. Сессии
 const sessionMiddleware = session({
@@ -81,11 +84,12 @@ const sessionMiddleware = session({
     secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
+    proxy: true, // Важно для работы за Nginx/Caddy
     cookie: { 
         maxAge: 30 * 24 * 60 * 60 * 1000, 
         httpOnly: true,
         sameSite: 'lax',
-        secure: process.env.NODE_ENV === 'production'
+        secure: true // Включаем, так как на домене будет HTTPS
     }
 });
 app.use(sessionMiddleware);
@@ -212,6 +216,10 @@ async function logAdminAction(action, details) {
 }
 
 // === МАРШРУТЫ ===
+
+app.get("/health", (req, res) => {
+    res.status(200).json({ status: "ok", time: new Date().toISOString(), port: process.env.PORT || 8080 });
+});
 
 app.get("/admin/download-timelapse", async (req, res) => {
     if (!req.isAuthenticated() || req.user.role !== 'admin') {
@@ -562,53 +570,135 @@ async function initDatabase() {
             attempts++;
             client = await pool.connect();
             connected = true;
-            console.log(`[${attempts}] БД готова.`);
+            console.log(`[${attempts}] БД подключена.`);
         } catch (err) {
-            if (attempts > 30) process.exit(1);
+            console.log(`[${attempts}] Ожидание БД... (${err.message})`);
+            if (attempts > 30) {
+                console.error("Не удалось подключиться к БД после 30 попыток.");
+                process.exit(1);
+            }
             await sleep(2000);
         }
     }
-    try {
-        await client.query(`CREATE TABLE IF NOT EXISTS "session" ("sid" varchar NOT NULL COLLATE "default", "sess" json NOT NULL, "expire" timestamp(6) NOT NULL) WITH (OIDS=FALSE);`).catch(() => {});
-        const pkExists = await client.query(`SELECT 1 FROM information_schema.table_constraints WHERE table_name='session' AND constraint_type='PRIMARY KEY'`);
-        if (pkExists.rowCount === 0) await client.query(`ALTER TABLE "session" ADD CONSTRAINT "session_pkey" PRIMARY KEY ("sid") NOT DEFERRABLE INITIALLY IMMEDIATE;`).catch(() => {});
-        await client.query(`CREATE INDEX IF NOT EXISTS "IDX_session_expire" ON "session" ("expire");`);
-        await client.query(`CREATE TABLE IF NOT EXISTS pixels (x INT, y INT, color VARCHAR(10) NOT NULL, user_id VARCHAR(50) NOT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (x, y))`);
-        await client.query(`CREATE TABLE IF NOT EXISTS settings (id INT PRIMARY KEY, canvas_size INT NOT NULL, cooldown INT NOT NULL, grid_enabled BOOLEAN NOT NULL, bg_color VARCHAR(10) DEFAULT '#1f2937')`);
-        await client.query(`CREATE TABLE IF NOT EXISTS users (user_id VARCHAR(50) PRIMARY KEY, last_placed_at BIGINT NOT NULL)`);
-        await client.query(`CREATE TABLE IF NOT EXISTS moderators (username VARCHAR(50) PRIMARY KEY, password VARCHAR(100) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
-        await client.query(`CREATE TABLE IF NOT EXISTS admin_logs (id SERIAL PRIMARY KEY, action VARCHAR(100) NOT NULL, details JSONB, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
-        
-        // История для откатов (храним 48 часов)
-        await client.query(`CREATE TABLE IF NOT EXISTS pixel_history (
-            id SERIAL PRIMARY KEY, 
-            x INTEGER NOT NULL, 
-            y INTEGER NOT NULL, 
-            color VARCHAR(50) NOT NULL, 
-            user_id VARCHAR(50) NOT NULL, 
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )`);
-        await client.query(`CREATE INDEX IF NOT EXISTS idx_pixel_history_time ON pixel_history(created_at)`);
-        await client.query(`CREATE INDEX IF NOT EXISTS idx_pixel_history_coords ON pixel_history(x, y)`);
 
-        // Снимки для таймлапса
-        await client.query(`CREATE TABLE IF NOT EXISTS snapshots (
-            id SERIAL PRIMARY KEY, 
-            data BYTEA NOT NULL, 
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )`);
-        await client.query(`INSERT INTO settings (id, canvas_size, cooldown, grid_enabled, bg_color) VALUES (1, 50, 2, true, '#1f2937') ON CONFLICT (id) DO NOTHING`);
+    try {
+        console.log("Проверка и инициализация таблиц...");
+        
+        // 1. Сессии
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS "session" (
+                "sid" varchar NOT NULL COLLATE "default",
+                "sess" json NOT NULL,
+                "expire" timestamp(6) NOT NULL
+            ) WITH (OIDS=FALSE);
+        `);
+        const pkExists = await client.query(`
+            SELECT 1 FROM information_schema.table_constraints 
+            WHERE table_name='session' AND constraint_type='PRIMARY KEY'
+        `);
+        if (pkExists.rowCount === 0) {
+            await client.query('ALTER TABLE "session" ADD CONSTRAINT "session_pkey" PRIMARY KEY ("sid") NOT DEFERRABLE INITIALLY IMMEDIATE');
+        }
+        await client.query('CREATE INDEX IF NOT EXISTS "IDX_session_expire" ON "session" ("expire")');
+
+        // 2. Основные таблицы игры
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS pixels (
+                x INT, 
+                y INT, 
+                color VARCHAR(10) NOT NULL, 
+                user_id VARCHAR(50) NOT NULL, 
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, 
+                PRIMARY KEY (x, y)
+            )
+        `);
+
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS settings (
+                id INT PRIMARY KEY, 
+                canvas_size INT NOT NULL, 
+                cooldown INT NOT NULL, 
+                grid_enabled BOOLEAN NOT NULL, 
+                bg_color VARCHAR(10) DEFAULT '#1f2937'
+            )
+        `);
+
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                user_id VARCHAR(50) PRIMARY KEY, 
+                last_placed_at BIGINT NOT NULL
+            )
+        `);
+
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS moderators (
+                username VARCHAR(50) PRIMARY KEY, 
+                password VARCHAR(100) NOT NULL, 
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS admin_logs (
+                id SERIAL PRIMARY KEY, 
+                action VARCHAR(100) NOT NULL, 
+                details JSONB, 
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        // 3. История и Таймлапс
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS pixel_history (
+                id SERIAL PRIMARY KEY, 
+                x INTEGER NOT NULL, 
+                y INTEGER NOT NULL, 
+                color VARCHAR(50) NOT NULL, 
+                user_id VARCHAR(50) NOT NULL, 
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        await client.query('CREATE INDEX IF NOT EXISTS idx_pixel_history_time ON pixel_history(created_at)');
+        await client.query('CREATE INDEX IF NOT EXISTS idx_pixel_history_coords ON pixel_history(x, y)');
+
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS snapshots (
+                id SERIAL PRIMARY KEY, 
+                data BYTEA NOT NULL, 
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        // 4. Начальные настройки
+        await client.query(`
+            INSERT INTO settings (id, canvas_size, cooldown, grid_enabled, bg_color) 
+            VALUES (1, 50, 2, true, '#1f2937') 
+            ON CONFLICT (id) DO NOTHING
+        `);
+
+        // Загрузка данных в память
         const settingsRes = await client.query("SELECT * FROM settings WHERE id = 1");
         if (settingsRes.rows.length > 0) currentSettings = settingsRes.rows[0];
+
         const usersRes = await client.query("SELECT user_id, last_placed_at FROM users");
         usersRes.rows.forEach(u => userCooldowns.set(u.user_id, parseInt(u.last_placed_at)));
-    } catch (err) { console.error(err); process.exit(1); } finally { if (client) client.release(); }
+
+        console.log("Инициализация БД успешно завершена.");
+    } catch (err) {
+        console.error("Ошибка при инициализации БД:", err);
+        process.exit(1);
+    } finally {
+        if (client) client.release();
+    }
 }
 
 async function startServer() {
     await initDatabase();
-    const PORT = process.env.PORT || 3000;
-    // Явно слушаем на 0.0.0.0 для Docker/PaaS
-    server.listen(PORT, "0.0.0.0", () => console.log(`>>> Server running on port ${PORT} (0.0.0.0) <<<`));
+    // По умолчанию 8080 для Amvera/PaaS
+    const PORT = process.env.PORT || 8080;
+    server.listen(PORT, "0.0.0.0", () => {
+        console.log(`>>> Сервер запущен! <<<`);
+        console.log(`>>> Слушает на: 0.0.0.0:${PORT} <<<`);
+    });
 }
 startServer();
