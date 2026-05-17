@@ -1,0 +1,40 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: pixel-battle-db-dev
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: supersecretpassword
+      POSTGRES_DB: pixelbattle
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+
+  app:
+    image: node:20-alpine
+    container_name: pixel-battle-app-dev
+    working_dir: /app
+    # Оставляем вашу команду для удобной разработки на ПК
+    command: sh -c "npm install express socket.io pg cors cookie-parser passport passport-local express-session connect-pg-simple helmet csurf csrf && node server.js"
+    environment:
+      - DB_USER=admin
+      - DB_PASSWORD=supersecretpassword
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=pixelbattle
+      - ADMIN_PASSWORD=supersecretadmin123
+    ports:
+      - "8080:3000"
+    volumes:
+      # Пробрасываем код, чтобы изменения сразу отражались
+      - ./backend:/app
+      - ./html:/app/public
+    depends_on:
+      - db
+
+volumes:
+  pgdata:

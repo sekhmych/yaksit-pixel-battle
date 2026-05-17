@@ -1,28 +1,18 @@
 version: '3.8'
 
 services:
-  # Наш Node.js сервер с WebSockets
   app:
     build: 
       context: .
       dockerfile: Dockerfile
     container_name: pixel-battle-app
-    env_file:
-      - .env
     environment:
-      - NODE_ENV=production
+      - DB_HOST=192.168.0.4
+      - DB_PORT=5432
+      - DB_USER=pixel_battle_db_user
+      - DB_PASSWORD=4>pf4ZR&J4Wp6e
+      - DB_NAME=pixel_battle
+      - ADMIN_PASSWORD=adminnesosal85780957
     ports:
-      - "8080:${PORT:-3000}"
-    depends_on:
-      - db
-    restart: unless-stopped
-
-  # Наша база данных PostgreSQL
-  db:
-    image: postgres:15-alpine
-    container_name: pixel-battle-db
-    environment:
-      POSTGRES_USER: ${DB_USER}
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
-      POSTGRES_DB: ${DB_NAME}
+      - "8080:3000"
     restart: unless-stopped

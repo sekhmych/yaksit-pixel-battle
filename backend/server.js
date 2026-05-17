@@ -46,7 +46,7 @@ app.use(helmet({
         useDefaults: true,
         directives: {
             "default-src": ["'self'"],
-            "script-src": ["'self'", (req, res) => `'nonce-${res.locals.nonce}'`, "blob:"], 
+            "script-src": ["'self'", (req, res) => `'nonce-${res.locals.nonce}'`, "blob:", "'unsafe-eval'"], 
             "style-src": ["'self'", "'unsafe-inline'"], 
             "img-src": ["'self'", "data:", "blob:"],
             "connect-src": ["'self'", "https://pixelbattle.hamaanda.ru", "ws://pixelbattle.hamaanda.ru", "wss://pixelbattle.hamaanda.ru"],
@@ -90,17 +90,42 @@ app.use(sessionMiddleware);
 
 // 6. Passport
 passport.use(new LocalStrategy({
-    usernameField: 'password', 
+    usernameField: 'username', 
     passwordField: 'password'
-}, (username, password, done) => {
-    if (password === ADMIN_PASSWORD) return done(null, { id: 'admin', role: 'admin' });
-    return done(null, false, { message: 'Неверный пароль' });
+}, async (username, password, done) => {
+    // Мастер-админ
+    if (username === 'admin' && password === ADMIN_PASSWORD) {
+        return done(null, { id: 'admin', role: 'admin' });
+    }
+    // Модераторы
+    try {
+        const res = await pool.query("SELECT * FROM moderators WHERE username = $1", [username]);
+        if (res.rows.length > 0) {
+            const mod = res.rows[0];
+            if (mod.password === password) { // В реальном проекте используйте bcrypt!
+                return done(null, { id: mod.username, role: 'moderator' });
+            }
+        }
+    } catch (err) { return done(err); }
+
+    return done(null, false, { message: 'Неверный логин или пароль' });
 }));
 
-passport.serializeUser((user, done) => done(null, user.id));
-passport.deserializeUser((id, done) => {
-    if (id === 'admin') return done(null, { id: 'admin', role: 'admin' });
-    done(new Error("User not found"));
+passport.serializeUser((user, done) => done(null, JSON.stringify(user)));
+passport.deserializeUser((data, done) => {
+    try {
+        // Проверяем, является ли data JSON-строкой (новый формат)
+        if (data && (data.startsWith('{') || data.startsWith('['))) {
+            return done(null, JSON.parse(data));
+        }
+        // Если это просто строка 'admin' (старый формат)
+        if (data === 'admin') {
+            return done(null, { id: 'admin', role: 'admin' });
+        }
+        done(null, false);
+    } catch (err) {
+        done(null, false);
+    }
 });
 
 app.use(passport.initialize());
@@ -217,7 +242,10 @@ io.use((socket, next) => {
         const userId = req.signedCookies.uid;
         if (!userId) return next(new Error("Invalid ID"));
         socket.userId = userId;
-        socket.isAdmin = !!(socket.request.user && socket.request.user.id === 'admin');
+        // Роли
+        socket.isAdmin = !!(socket.request.user && socket.request.user.role === 'admin');
+        socket.isModerator = !!(socket.request.user && socket.request.user.role === 'moderator');
+        socket.canEditCanvas = socket.isAdmin || socket.isModerator;
         next();
     });
 });
@@ -248,14 +276,21 @@ io.on("connection", async (socket) => {
 
     try {
         const pixelsRes = await pool.query("SELECT x, y, color, user_id FROM pixels");
-        const initPayload = { pixels: pixelsRes.rows, settings: currentSettings, userId: userId };
-        if (isAdmin) {
+        const initPayload = { 
+            pixels: pixelsRes.rows, 
+            settings: currentSettings, 
+            userId: userId,
+            role: socket.request.user ? socket.request.user.role : 'user'
+        };
+        if (socket.canEditCanvas) {
             const logsRes = await pool.query("SELECT * FROM admin_logs ORDER BY created_at DESC LIMIT 100");
             initPayload.adminLogs = logsRes.rows;
         }
         socket.emit("init_data", initPayload);
         const lastPlaced = userCooldowns.get(userId) || 0;
-        socket.emit("user_status", { lastPlaced });
+        const cooldownMs = currentSettings.cooldown * 1000;
+        const remainingCooldownMs = Math.max(0, cooldownMs - (Date.now() - lastPlaced));
+        socket.emit("user_status", { remainingCooldownMs });
     } catch (err) { console.error(err); }
 
     socket.on("set_pixel", async (data) => {
@@ -267,14 +302,71 @@ io.on("connection", async (socket) => {
             const now = Date.now();
             const lastPlaced = userCooldowns.get(userId) || 0;
             const cooldownMs = currentSettings.cooldown * 1000;
-            if (!isAdmin && now - lastPlaced < cooldownMs - 100) return;
-            if (!isAdmin) {
+            if (!socket.canEditCanvas && now - lastPlaced < cooldownMs - 100) return;
+            if (!socket.canEditCanvas) {
                 userCooldowns.set(userId, now);
                 await pool.query("INSERT INTO users (user_id, last_placed_at) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET last_placed_at = EXCLUDED.last_placed_at", [userId, now]);
             }
             await pool.query(`INSERT INTO pixels (x, y, color, user_id) VALUES ($1, $2, $3, $4) ON CONFLICT (x, y) DO UPDATE SET color = EXCLUDED.color, user_id = EXCLUDED.user_id, updated_at = CURRENT_TIMESTAMP`, [x, y, color, userId]);
             io.emit("pixel_update", { x, y, color, userId });
+            if (socket.canEditCanvas) {
+                await logAdminAction("SET_PIXEL", { user: userId, x, y, color, role: socket.isAdmin ? 'admin' : 'moderator' });
+            }
         } catch (err) { console.error(err); }
+    });
+
+    socket.on("delete_pixel", async (payload) => {
+        if (!socket.canEditCanvas) return;
+        const data = payload && payload.data ? payload.data : payload;
+        const { x, y } = data;
+        if (typeof x !== "number" || typeof y !== "number") return;
+        try {
+            await pool.query("DELETE FROM pixels WHERE x = $1 AND y = $2", [x, y]);
+            await logAdminAction("DELETE_PIXEL", { user: userId, x, y, role: socket.isAdmin ? 'admin' : 'moderator' });
+            io.emit("pixel_deleted", { x, y });
+        } catch (err) { console.error(err); }
+    });
+
+    // === УПРАВЛЕНИЕ МОДЕРАТОРАМИ ===
+
+    socket.on("list_moderators", async (payload, callback) => {
+        if (!socket.isAdmin || !verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
+        try {
+            const res = await pool.query("SELECT username, created_at FROM moderators ORDER BY created_at DESC");
+            if (typeof callback === 'function') callback({ success: true, moderators: res.rows });
+        } catch (err) { if (typeof callback === 'function') callback({ success: false }); }
+    });
+
+    socket.on("create_moderator", async (payload, callback) => {
+        if (!socket.isAdmin || !verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
+        const { username, password } = payload.data;
+        if (!username || !password) return callback && callback({ success: false });
+        try {
+            await pool.query("INSERT INTO moderators (username, password) VALUES ($1, $2)", [username, password]);
+            await logAdminAction("CREATE_MODERATOR", { admin: userId, moderator: username });
+            if (typeof callback === 'function') callback({ success: true });
+        } catch (err) { if (typeof callback === 'function') callback({ success: false, error: "Username already exists" }); }
+    });
+
+    socket.on("delete_moderator", async (payload, callback) => {
+        if (!socket.isAdmin || !verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
+        const { username } = payload.data;
+        try {
+            await pool.query("DELETE FROM moderators WHERE username = $1", [username]);
+            await logAdminAction("DELETE_MODERATOR", { admin: userId, moderator: username });
+            if (typeof callback === 'function') callback({ success: true });
+        } catch (err) { if (typeof callback === 'function') callback({ success: false }); }
+    });
+
+    socket.on("update_moderator_password", async (payload, callback) => {
+        if (!socket.isAdmin || !verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
+        const { username, newPassword } = payload.data;
+        if (!username || !newPassword) return callback && callback({ success: false });
+        try {
+            await pool.query("UPDATE moderators SET password = $1 WHERE username = $2", [newPassword, username]);
+            await logAdminAction("UPDATE_MOD_PASSWORD", { admin: userId, moderator: username });
+            if (typeof callback === 'function') callback({ success: true });
+        } catch (err) { if (typeof callback === 'function') callback({ success: false }); }
     });
 
     socket.on("clear_canvas", async (payload) => {
@@ -360,6 +452,7 @@ async function initDatabase() {
         await client.query(`CREATE TABLE IF NOT EXISTS pixels (x INT, y INT, color VARCHAR(10) NOT NULL, user_id VARCHAR(50) NOT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (x, y))`);
         await client.query(`CREATE TABLE IF NOT EXISTS settings (id INT PRIMARY KEY, canvas_size INT NOT NULL, cooldown INT NOT NULL, grid_enabled BOOLEAN NOT NULL, bg_color VARCHAR(10) DEFAULT '#1f2937')`);
         await client.query(`CREATE TABLE IF NOT EXISTS users (user_id VARCHAR(50) PRIMARY KEY, last_placed_at BIGINT NOT NULL)`);
+        await client.query(`CREATE TABLE IF NOT EXISTS moderators (username VARCHAR(50) PRIMARY KEY, password VARCHAR(100) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
         await client.query(`CREATE TABLE IF NOT EXISTS admin_logs (id SERIAL PRIMARY KEY, action VARCHAR(100) NOT NULL, details JSONB, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
         await client.query(`INSERT INTO settings (id, canvas_size, cooldown, grid_enabled, bg_color) VALUES (1, 50, 2, true, '#1f2937') ON CONFLICT (id) DO NOTHING`);
         const settingsRes = await client.query("SELECT * FROM settings WHERE id = 1");
