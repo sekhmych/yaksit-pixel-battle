@@ -1,35 +1,23 @@
-# Используем Node.js (Debian-based slim)
-FROM node:20-slim
-
-# Устанавливаем системные зависимости для сборки модуля 'canvas'
-# pkg-config и libpixman необходимы для корректного обнаружения библиотек в Debian
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    pkg-config \
-    libcairo2-dev \
-    libpango1.0-dev \
-    libjpeg-dev \
-    libgif-dev \
-    librsvg2-dev \
-    libpixman-1-dev \
-    python3 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Явно указываем путь к Python для node-gyp
-ENV PYTHON=/usr/bin/python3
+# Используем легкий образ Node.js
+FROM node:20-alpine
 
 # Создаем рабочую директорию
 WORKDIR /app
 
-# Копируем только файлы манифеста для установки зависимостей (используем кэширование слоев)
+# Копируем файлы манифеста
 COPY ./backend/package*.json ./
 
-# Устанавливаем зависимости. Флаг --build-from-source заставляет скомпилировать canvas правильно под Debian
-RUN npm install --build-from-source
+# Устанавливаем зависимости (теперь без компиляции, так как используем jimp)
+RUN npm install --omit=dev
 
-# Копируем остальной код (папка node_modules будет проигнорирована благодаря .dockerignore)
+# Копируем исходный код бэкенда
 COPY ./backend /app
+
+# Копируем фронтенд в папку public
 COPY ./html /app/public
+
+# Явно открываем порт 3000 для проксирования
+EXPOSE 3000
 
 # Запускаем сервер
 CMD ["node", "server.js"]

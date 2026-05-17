@@ -51,7 +51,7 @@ app.use(helmet({
             "script-src": ["'self'", (req, res) => `'nonce-${res.locals.nonce}'`, "blob:", "'unsafe-eval'"], 
             "style-src": ["'self'", "'unsafe-inline'"], 
             "img-src": ["'self'", "data:", "blob:"],
-            "connect-src": ["'self'", "https://pixelbattle.hamaanda.ru", "ws://pixelbattle.hamaanda.ru", "wss://pixelbattle.hamaanda.ru"],
+            "connect-src": ["'self'", "https://pixelbattle.hamaanda.ru", "ws://pixelbattle.hamaanda.ru", "wss://pixelbattle.hamaanda.ru", "https://*.hamaanda.ru", "wss://*.hamaanda.ru"],
             "frame-ancestors": ["'none'"],
         }
     },
@@ -608,6 +608,7 @@ async function initDatabase() {
 async function startServer() {
     await initDatabase();
     const PORT = process.env.PORT || 3000;
-    server.listen(PORT, () => console.log(`>>> Server running on port ${PORT} <<<`));
+    // Явно слушаем на 0.0.0.0 для Docker/PaaS
+    server.listen(PORT, "0.0.0.0", () => console.log(`>>> Server running on port ${PORT} (0.0.0.0) <<<`));
 }
 startServer();
