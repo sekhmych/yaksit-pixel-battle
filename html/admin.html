@@ -69,6 +69,7 @@
                 <div class="flex gap-2">
                     <button @click="activeTab = 'settings'" :class="activeTab === 'settings' ? 'active-tab' : ''" class="tab-btn px-6 py-2 rounded-lg font-bold text-sm transition">Настройки</button>
                     <button @click="activeTab = 'moderators'" :class="activeTab === 'moderators' ? 'active-tab' : ''" class="tab-btn px-6 py-2 rounded-lg font-bold text-sm transition">Модераторы</button>
+                    <button @click="activeTab = 'history'" :class="activeTab === 'history' ? 'active-tab' : ''" class="tab-btn px-6 py-2 rounded-lg font-bold text-sm transition">История</button>
                     <button @click="activeTab = 'system'" :class="activeTab === 'system' ? 'active-tab' : ''" class="tab-btn px-6 py-2 rounded-lg font-bold text-sm transition">Система</button>
                 </div>
             </template>
@@ -193,6 +194,80 @@
                     <template x-if="moderators.length === 0">
                         <div class="text-center py-8 text-gray-500 italic">Модераторы не созданы</div>
                     </template>
+                </div>
+            </div>
+        </div>
+
+        <div x-show="activeTab === 'history'" x-cloak class="tab-content space-y-6" x-data="{ 
+            rollback: { x1: 0, y1: 0, x2: 10, y2: 10, time: 60 },
+            async applyRollback() {
+                if (confirm(`Откатить область [${this.rollback.x1},${this.rollback.y1}] - [${this.rollback.x2},${this.rollback.y2}] на ${this.rollback.time} мин?`)) {
+                    emitWithAuth('rollback_area', {
+                        x1: parseInt(this.rollback.x1),
+                        y1: parseInt(this.rollback.y1),
+                        x2: parseInt(this.rollback.x2),
+                        y2: parseInt(this.rollback.y2),
+                        timeAgoMinutes: parseInt(this.rollback.time)
+                    }, (res) => {
+                        if (res.success) alert(`Откат завершен! Обновлено пикселей: ${res.count}`);
+                        else alert('Ошибка при откате');
+                    });
+                }
+            }
+        }">
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                <!-- Откат области -->
+                <div class="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl">
+                    <h2 class="text-lg font-bold mb-6 text-orange-400 italic">⏪ Откат области (Rollback)</h2>
+                    <div class="space-y-4">
+                        <div class="grid grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-[10px] font-bold text-gray-500 uppercase mb-1">Точка 1 (X, Y)</label>
+                                <div class="flex gap-2">
+                                    <input type="number" x-model="rollback.x1" class="w-full bg-gray-900 border border-gray-700 p-2 rounded-lg outline-none focus:border-orange-500 text-sm">
+                                    <input type="number" x-model="rollback.y1" class="w-full bg-gray-900 border border-gray-700 p-2 rounded-lg outline-none focus:border-orange-500 text-sm">
+                                </div>
+                            </div>
+                            <div>
+                                <label class="block text-[10px] font-bold text-gray-500 uppercase mb-1">Точка 2 (X, Y)</label>
+                                <div class="flex gap-2">
+                                    <input type="number" x-model="rollback.x2" class="w-full bg-gray-900 border border-gray-700 p-2 rounded-lg outline-none focus:border-orange-500 text-sm">
+                                    <input type="number" x-model="rollback.y2" class="w-full bg-gray-900 border border-gray-700 p-2 rounded-lg outline-none focus:border-orange-500 text-sm">
+                                </div>
+                            </div>
+                        </div>
+                        <div>
+                            <label class="block text-[10px] font-bold text-gray-500 uppercase mb-1">Откатить назад на (минут)</label>
+                            <input type="number" x-model="rollback.time" class="w-full bg-gray-900 border border-gray-700 p-3 rounded-lg outline-none focus:border-orange-500">
+                            <p class="text-[10px] text-gray-500 mt-1">* Будет восстановлено состояние пикселей, которое было в этот момент времени.</p>
+                        </div>
+                        <button @click="applyRollback()" class="w-full bg-orange-600 hover:bg-orange-500 py-3 rounded-xl font-bold transition uppercase tracking-widest shadow-lg">Выполнить откат</button>
+                    </div>
+                </div>
+
+                <!-- Таймлапс -->
+                <div class="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl flex flex-col">
+                    <h2 class="text-lg font-bold mb-6 text-blue-400 italic">📸 Таймлапс и Снимки</h2>
+                    <div class="flex-1 flex flex-col justify-center items-center text-center space-y-4">
+                        <div class="p-6 bg-gray-900 rounded-full border-4 border-gray-700">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-12 w-12 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                            </svg>
+                        </div>
+                        <div>
+                            <p class="text-sm text-gray-300">Сервер делает снимки холста каждые 10 минут.</p>
+                            <p class="text-xs text-gray-500 mt-1">Все снимки хранятся в базе данных в бинарном виде.</p>
+                        </div>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full">
+                            <button @click="emitWithAuth('create_manual_snapshot', {}, (res) => { if(res.success) alert('Снимок создан!'); })" 
+                                    class="bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-bold transition flex items-center justify-center gap-2 text-xs">
+                                📸 СОЗДАТЬ СЕЙЧАС
+                            </button>
+                            <a href="/admin/download-timelapse" class="bg-blue-600 hover:bg-blue-500 py-3 rounded-xl font-bold transition flex items-center justify-center gap-2 text-xs shadow-lg">
+                                📥 СКАЧАТЬ ZIP
+                            </a>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>

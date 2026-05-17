@@ -13,6 +13,8 @@ const helmet = require("helmet");
 const csrf = require("csurf");
 const fs = require("fs");
 const Tokens = require('csrf');
+const Jimp = require('jimp');
+const archiver = require('archiver');
 
 // === ГЛОБАЛЬНЫЕ ОБРАБОТЧИКИ ОШИБОК ===
 process.on('uncaughtException', (err) => {
@@ -150,6 +152,37 @@ app.use((err, req, res, next) => {
 
 // === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 
+async function takeSnapshot() {
+    try {
+        const size = currentSettings.canvas_size;
+        // Создаем изображение с фоновым цветом
+        const image = new Jimp(size, size, currentSettings.bg_color || '#1f2937');
+
+        // Получаем все пиксели
+        const res = await pool.query("SELECT x, y, color FROM pixels");
+        res.rows.forEach(p => {
+            try {
+                // Преобразуем HEX в числовой формат Jimp и ставим пиксель
+                const hexColor = Jimp.cssColorToHex(p.color);
+                image.setPixelColor(hexColor, p.x, p.y);
+            } catch (e) { /* Игнорируем битые цвета */ }
+        });
+
+        const buffer = await image.getBufferAsync(Jimp.MIME_PNG);
+        await pool.query("INSERT INTO snapshots (data) VALUES ($1)", [buffer]);
+        console.log(`[Snapshot] Снимок холста сохранен (${size}x${size}) через Jimp`);
+    } catch (err) { console.error("Snapshot error:", err); }
+}
+
+// Фоновые задачи
+setInterval(takeSnapshot, 10 * 60 * 1000); // Снимок каждые 10 минут
+setInterval(async () => {
+    try {
+        await pool.query("DELETE FROM pixel_history WHERE created_at < NOW() - INTERVAL '48 hours'");
+        console.log("[Cleanup] Старая история удалена");
+    } catch (err) { console.error("Cleanup error:", err); }
+}, 60 * 60 * 1000); // Очистка каждый час
+
 function sendHtmlWithContext(res, filePath, csrfToken = null) {
     fs.readFile(filePath, 'utf8', (err, data) => {
         if (err) return res.status(500).send("Server Error");
@@ -179,6 +212,35 @@ async function logAdminAction(action, details) {
 }
 
 // === МАРШРУТЫ ===
+
+app.get("/admin/download-timelapse", async (req, res) => {
+    if (!req.isAuthenticated() || req.user.role !== 'admin') {
+        return res.status(403).send("Access Denied");
+    }
+
+    try {
+        const snapshotsRes = await pool.query("SELECT data, created_at FROM snapshots ORDER BY created_at ASC");
+        
+        if (snapshotsRes.rows.length === 0) {
+            return res.status(404).send("No snapshots found");
+        }
+
+        const archive = archiver('zip', { zlib: { level: 9 } });
+        res.attachment(`pixel-battle-timelapse-${new Date().toISOString().split('T')[0]}.zip`);
+        archive.pipe(res);
+
+        snapshotsRes.rows.forEach((row, index) => {
+            const time = new Date(row.created_at).toISOString().replace(/[:.]/g, '-');
+            archive.append(row.data, { name: `snapshot_${time}_${index}.png` });
+        });
+
+        await archive.finalize();
+        await logAdminAction("DOWNLOAD_TIMELAPSE", { user: req.user.id });
+    } catch (err) {
+        console.error("Zip error:", err);
+        res.status(500).send("Error creating archive");
+    }
+});
 
 app.get("/admin/login", csrfProtection, (req, res) => {
     if (req.isAuthenticated()) return res.redirect("/admin");
@@ -308,6 +370,10 @@ io.on("connection", async (socket) => {
                 await pool.query("INSERT INTO users (user_id, last_placed_at) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET last_placed_at = EXCLUDED.last_placed_at", [userId, now]);
             }
             await pool.query(`INSERT INTO pixels (x, y, color, user_id) VALUES ($1, $2, $3, $4) ON CONFLICT (x, y) DO UPDATE SET color = EXCLUDED.color, user_id = EXCLUDED.user_id, updated_at = CURRENT_TIMESTAMP`, [x, y, color, userId]);
+            
+            // Запись в историю для откатов
+            await pool.query(`INSERT INTO pixel_history (x, y, color, user_id) VALUES ($1, $2, $3, $4)`, [x, y, color, userId]);
+
             io.emit("pixel_update", { x, y, color, userId });
             if (socket.canEditCanvas) {
                 await logAdminAction("SET_PIXEL", { user: userId, x, y, color, role: socket.isAdmin ? 'admin' : 'moderator' });
@@ -369,6 +435,15 @@ io.on("connection", async (socket) => {
         } catch (err) { if (typeof callback === 'function') callback({ success: false }); }
     });
 
+    socket.on("create_manual_snapshot", async (payload, callback) => {
+        if (!socket.isAdmin || !verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
+        try {
+            await takeSnapshot();
+            await logAdminAction("MANUAL_SNAPSHOT", { user: userId });
+            if (typeof callback === 'function') callback({ success: true });
+        } catch (err) { if (typeof callback === 'function') callback({ success: false }); }
+    });
+
     socket.on("clear_canvas", async (payload) => {
         if (!verifyAdminCsrf(socket, payload)) return;
         try {
@@ -425,6 +500,55 @@ io.on("connection", async (socket) => {
             if (typeof callback === 'function') callback({ success: true });
         } catch (err) { await pool.query("ROLLBACK"); if (typeof callback === 'function') callback({ success: false }); }
     });
+
+    socket.on("rollback_area", async (payload, callback) => {
+        if (!socket.isAdmin || !verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
+        const { x1, y1, x2, y2, timeAgoMinutes } = payload.data;
+        if (x1 === undefined || y1 === undefined || x2 === undefined || y2 === undefined || !timeAgoMinutes) {
+            return callback && callback({ success: false, error: "Missing parameters" });
+        }
+
+        try {
+            const targetTime = new Date(Date.now() - timeAgoMinutes * 60 * 1000);
+            
+            // Находим последние состояния пикселей до указанного времени в этой области
+            const res = await pool.query(`
+                SELECT DISTINCT ON (x, y) x, y, color, user_id 
+                FROM pixel_history 
+                WHERE x >= $1 AND x <= $2 AND y >= $3 AND y <= $4 AND created_at <= $5
+                ORDER BY x, y, created_at DESC
+            `, [Math.min(x1, x2), Math.max(x1, x2), Math.min(y1, y2), Math.max(y1, y2), targetTime]);
+
+            await pool.query("BEGIN");
+            // Сначала очищаем область
+            await pool.query("DELETE FROM pixels WHERE x >= $1 AND x <= $2 AND y >= $3 AND y <= $4", [Math.min(x1, x2), Math.max(x1, x2), Math.min(y1, y2), Math.max(y1, y2)]);
+            
+            // Вставляем старые состояния
+            if (res.rows.length > 0) {
+                for (let i = 0; i < res.rows.length; i += 1000) {
+                    const chunk = res.rows.slice(i, i + 1000);
+                    const values = chunk.map((p, idx) => `($${idx * 4 + 1}, $${idx * 4 + 2}, $${idx * 4 + 3}, $${idx * 4 + 4})`).join(", ");
+                    const params = [];
+                    chunk.forEach(p => params.push(p.x, p.y, p.color, p.user_id));
+                    await pool.query(`INSERT INTO pixels (x, y, color, user_id) VALUES ${values}`, params);
+                }
+            }
+            await pool.query("COMMIT");
+
+            await logAdminAction("ROLLBACK_AREA", { user: userId, x1, y1, x2, y2, timeAgoMinutes });
+            
+            // Уведомляем всех об обновлении (проще всего переинициализировать область)
+            // Но для красоты отправим каждому клиенту инфу
+            const updatedPixels = await pool.query("SELECT x, y, color, user_id FROM pixels");
+            io.emit("init_data", { pixels: updatedPixels.rows, settings: currentSettings });
+            
+            if (typeof callback === 'function') callback({ success: true, count: res.rows.length });
+        } catch (err) { 
+            await pool.query("ROLLBACK");
+            console.error(err);
+            if (typeof callback === 'function') callback({ success: false }); 
+        }
+    });
 });
 
 // === ЗАПУСК ===
@@ -454,6 +578,25 @@ async function initDatabase() {
         await client.query(`CREATE TABLE IF NOT EXISTS users (user_id VARCHAR(50) PRIMARY KEY, last_placed_at BIGINT NOT NULL)`);
         await client.query(`CREATE TABLE IF NOT EXISTS moderators (username VARCHAR(50) PRIMARY KEY, password VARCHAR(100) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
         await client.query(`CREATE TABLE IF NOT EXISTS admin_logs (id SERIAL PRIMARY KEY, action VARCHAR(100) NOT NULL, details JSONB, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
+        
+        // История для откатов (храним 48 часов)
+        await client.query(`CREATE TABLE IF NOT EXISTS pixel_history (
+            id SERIAL PRIMARY KEY, 
+            x INTEGER NOT NULL, 
+            y INTEGER NOT NULL, 
+            color VARCHAR(50) NOT NULL, 
+            user_id VARCHAR(50) NOT NULL, 
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_pixel_history_time ON pixel_history(created_at)`);
+        await client.query(`CREATE INDEX IF NOT EXISTS idx_pixel_history_coords ON pixel_history(x, y)`);
+
+        // Снимки для таймлапса
+        await client.query(`CREATE TABLE IF NOT EXISTS snapshots (
+            id SERIAL PRIMARY KEY, 
+            data BYTEA NOT NULL, 
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )`);
         await client.query(`INSERT INTO settings (id, canvas_size, cooldown, grid_enabled, bg_color) VALUES (1, 50, 2, true, '#1f2937') ON CONFLICT (id) DO NOTHING`);
         const settingsRes = await client.query("SELECT * FROM settings WHERE id = 1");
         if (settingsRes.rows.length > 0) currentSettings = settingsRes.rows[0];
