@@ -3,7 +3,6 @@ services:
     build: 
       context: .
       dockerfile: Dockerfile
-    container_name: pixel-battle-app
     environment:
       - DB_HOST=192.168.0.4
       - DB_PORT=5432
@@ -11,7 +10,7 @@ services:
       - DB_PASSWORD=4>pf4ZR&J4Wp6e
       - DB_NAME=pixel_battle
       - ADMIN_PASSWORD=adminnesosal85780957
-      - PORT=8080
+      - PORT=3000
     ports:
-      - "8080:8080"
+      - "8888:3000"
     restart: unless-stopped
