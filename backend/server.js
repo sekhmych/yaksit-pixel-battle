@@ -15,6 +15,7 @@ const fs = require("fs");
 const Tokens = require('csrf');
 const Jimp = require('jimp');
 const archiver = require('archiver');
+const bcrypt = require('bcryptjs');
 
 // === ГЛОБАЛЬНЫЕ ОБРАБОТЧИКИ ОШИБОК ===
 process.on('uncaughtException', (err) => {
@@ -95,12 +96,18 @@ const sessionMiddleware = session({
 app.use(sessionMiddleware);
 
 // 6. Passport
+function timingSafeEqualStr(a, b) {
+    const ha = crypto.createHash("sha256").update(String(a)).digest();
+    const hb = crypto.createHash("sha256").update(String(b)).digest();
+    return crypto.timingSafeEqual(ha, hb);
+}
+
 passport.use(new LocalStrategy({
-    usernameField: 'username', 
+    usernameField: 'username',
     passwordField: 'password'
 }, async (username, password, done) => {
     // Мастер-админ
-    if (username === 'admin' && password === ADMIN_PASSWORD) {
+    if (username === 'admin' && timingSafeEqualStr(password, ADMIN_PASSWORD)) {
         return done(null, { id: 'admin', role: 'admin' });
     }
     // Модераторы
@@ -108,7 +115,9 @@ passport.use(new LocalStrategy({
         const res = await pool.query("SELECT * FROM moderators WHERE username = $1", [username]);
         if (res.rows.length > 0) {
             const mod = res.rows[0];
-            if (mod.password === password) { // В реальном проекте используйте bcrypt!
+            let match = false;
+            try { match = await bcrypt.compare(password, mod.password); } catch (e) { match = false; }
+            if (match) {
                 return done(null, { id: mod.username, role: 'moderator' });
             }
         }
@@ -116,6 +125,23 @@ passport.use(new LocalStrategy({
 
     return done(null, false, { message: 'Неверный логин или пароль' });
 }));
+
+// Rate-limit брутфорса логина (по IP)
+const loginAttempts = new Map();
+const LOGIN_LIMIT = 10;
+const LOGIN_WINDOW_MS = 5 * 60 * 1000;
+function loginRateLimit(req, res, next) {
+    const key = req.ip;
+    const now = Date.now();
+    const entry = loginAttempts.get(key) || { count: 0, startTime: now };
+    if (now - entry.startTime > LOGIN_WINDOW_MS) { entry.count = 0; entry.startTime = now; }
+    entry.count++;
+    loginAttempts.set(key, entry);
+    if (entry.count > LOGIN_LIMIT) {
+        return res.status(429).send("Слишком много попыток входа. Попробуйте позже.");
+    }
+    next();
+}
 
 passport.serializeUser((user, done) => done(null, JSON.stringify(user)));
 passport.deserializeUser((data, done) => {
@@ -255,7 +281,7 @@ app.get("/admin/login", csrfProtection, (req, res) => {
     sendHtmlWithContext(res, path.join(__dirname, "public", "login.html"), req.csrfToken());
 });
 
-app.post("/admin/login", csrfProtection, passport.authenticate("local", {
+app.post("/admin/login", loginRateLimit, csrfProtection, passport.authenticate("local", {
     successRedirect: "/admin",
     failureRedirect: "/admin/login"
 }));
@@ -321,6 +347,7 @@ io.use((socket, next) => {
 });
 
 let currentSettings = { canvas_size: 50, cooldown: 2, grid_enabled: true, bg_color: '#1f2937' };
+const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 const userCooldowns = new Map();
 const messageRates = new Map();
 const MSG_LIMIT = 100; 
@@ -367,7 +394,8 @@ io.on("connection", async (socket) => {
         try {
             if (!data) return;
             const { x, y, color } = data;
-            if (typeof x !== "number" || typeof y !== "number" || typeof color !== "string") return;
+            if (!Number.isInteger(x) || !Number.isInteger(y) || typeof color !== "string") return;
+            if (!HEX_COLOR_RE.test(color)) return;
             if (x < 0 || x >= currentSettings.canvas_size || y < 0 || y >= currentSettings.canvas_size) return;
             const now = Date.now();
             const lastPlaced = userCooldowns.get(userId) || 0;
@@ -393,7 +421,7 @@ io.on("connection", async (socket) => {
         if (!socket.canEditCanvas) return;
         const data = payload && payload.data ? payload.data : payload;
         const { x, y } = data;
-        if (typeof x !== "number" || typeof y !== "number") return;
+        if (!Number.isInteger(x) || !Number.isInteger(y)) return;
         try {
             await pool.query("DELETE FROM pixels WHERE x = $1 AND y = $2", [x, y]);
             await logAdminAction("DELETE_PIXEL", { user: userId, x, y, role: socket.isAdmin ? 'admin' : 'moderator' });
@@ -415,8 +443,10 @@ io.on("connection", async (socket) => {
         if (!socket.isAdmin || !verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
         const { username, password } = payload.data;
         if (!username || !password) return callback && callback({ success: false });
+        if (password.length < 8) return callback && callback({ success: false, error: "Password too short" });
         try {
-            await pool.query("INSERT INTO moderators (username, password) VALUES ($1, $2)", [username, password]);
+            const hash = await bcrypt.hash(password, 12);
+            await pool.query("INSERT INTO moderators (username, password) VALUES ($1, $2)", [username, hash]);
             await logAdminAction("CREATE_MODERATOR", { admin: userId, moderator: username });
             if (typeof callback === 'function') callback({ success: true });
         } catch (err) { if (typeof callback === 'function') callback({ success: false, error: "Username already exists" }); }
@@ -436,8 +466,10 @@ io.on("connection", async (socket) => {
         if (!socket.isAdmin || !verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
         const { username, newPassword } = payload.data;
         if (!username || !newPassword) return callback && callback({ success: false });
+        if (newPassword.length < 8) return callback && callback({ success: false, error: "Password too short" });
         try {
-            await pool.query("UPDATE moderators SET password = $1 WHERE username = $2", [newPassword, username]);
+            const hash = await bcrypt.hash(newPassword, 12);
+            await pool.query("UPDATE moderators SET password = $1 WHERE username = $2", [hash, username]);
             await logAdminAction("UPDATE_MOD_PASSWORD", { admin: userId, moderator: username });
             if (typeof callback === 'function') callback({ success: true });
         } catch (err) { if (typeof callback === 'function') callback({ success: false }); }
@@ -464,10 +496,19 @@ io.on("connection", async (socket) => {
     socket.on("update_settings", async (payload) => {
         if (!verifyAdminCsrf(socket, payload) || !payload.data) return;
         const newSettings = payload.data;
+
+        const canvasSize = Number.isInteger(newSettings.canvas_size) ? newSettings.canvas_size : currentSettings.canvas_size;
+        const cooldown = Number.isInteger(newSettings.cooldown) ? newSettings.cooldown : currentSettings.cooldown;
+        const gridEnabled = typeof newSettings.grid_enabled === "boolean" ? newSettings.grid_enabled : currentSettings.grid_enabled;
+        const bgColor = HEX_COLOR_RE.test(newSettings.bg_color) ? newSettings.bg_color : currentSettings.bg_color;
+
+        if (canvasSize < 10 || canvasSize > 1000 || cooldown < 0 || cooldown > 3600) return;
+
+        const validated = { canvas_size: canvasSize, cooldown, grid_enabled: gridEnabled, bg_color: bgColor };
         try {
-            await pool.query(`UPDATE settings SET canvas_size = $1, cooldown = $2, grid_enabled = $3, bg_color = $4 WHERE id = 1`, [newSettings.canvas_size || 50, newSettings.cooldown || 2, newSettings.grid_enabled !== undefined ? newSettings.grid_enabled : true, newSettings.bg_color || '#1f2937']);
-            currentSettings = { ...currentSettings, ...newSettings };
-            await logAdminAction("UPDATE_SETTINGS", { user: userId, settings: newSettings });
+            await pool.query(`UPDATE settings SET canvas_size = $1, cooldown = $2, grid_enabled = $3, bg_color = $4 WHERE id = 1`, [validated.canvas_size, validated.cooldown, validated.grid_enabled, validated.bg_color]);
+            currentSettings = validated;
+            await logAdminAction("UPDATE_SETTINGS", { user: userId, settings: validated });
             io.emit("settings_updated", currentSettings);
         } catch (err) { console.error(err); }
     });

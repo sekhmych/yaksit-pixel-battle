@@ -6,7 +6,7 @@
     <title>Панель управления | Подслушано ЯКСИТ x Pixel Battle by Hamaanda</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>⚙️</text></svg>">
     <script src="/alpine.min.js" defer></script>
-    <script src="/tailwindcss.js"></script>
+    <link rel="stylesheet" href="/tailwind.css">
     <script src="/socket.io.min.js"></script>
 </head>
 <body class="bg-gray-900 text-white min-h-screen p-4 sm:p-8" x-data="{ 
@@ -458,7 +458,15 @@
             if (entry.action === 'SET_PIXEL') detailsStr = `нарисовал пиксель [${entry.details.x}, ${entry.details.y}] цвет ${entry.details.color}`;
             if (entry.action === 'DELETE_PIXEL') detailsStr = `удалил пиксель [${entry.details.x}, ${entry.details.y}]`;
 
-            li.innerHTML = `<span class="text-gray-500">[${time}]</span> <span class="text-blue-400">${entry.action}</span>: ${detailsStr}`;
+            const timeSpan = document.createElement('span');
+            timeSpan.className = 'text-gray-500';
+            timeSpan.textContent = `[${time}]`;
+
+            const actionSpan = document.createElement('span');
+            actionSpan.className = 'text-blue-400';
+            actionSpan.textContent = entry.action;
+
+            li.append(timeSpan, ' ', actionSpan, `: ${detailsStr}`);
             log.prepend(li);
             if (log.children.length > 150) log.removeChild(log.lastChild);
         }
