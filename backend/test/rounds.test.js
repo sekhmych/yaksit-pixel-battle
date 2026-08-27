@@ -7,6 +7,7 @@ const {
     assertPixelAllowed,
     normalizeRoundPixelImport,
     startRoundTx,
+    autoStartEligibleDraftTx,
     finishRound
 } = require("../lib/rounds");
 
@@ -201,4 +202,49 @@ test("finishRound locks the active round before building the final archive", asy
 
     assert.equal(result.status, "finished");
     assert.match(client.calls[0].sql, /FOR UPDATE/);
+});
+
+test("autoStartEligibleDraftTx returns null when no draft is due yet", async () => {
+    const client = makeMockClient((sql) => {
+        if (sql.includes("WHERE status = 'draft' AND starts_at")) return { rows: [] };
+        return { rows: [] };
+    });
+    const result = await autoStartEligibleDraftTx(client, new Date("2026-06-01T12:00:00.000Z"));
+    assert.equal(result, null);
+    assert.equal(client.calls.length, 1, "does not attempt to start anything when nothing is eligible");
+});
+
+test("autoStartEligibleDraftTx starts the earliest eligible draft", async () => {
+    const client = makeMockClient((sql) => {
+        if (sql.includes("WHERE status = 'draft' AND starts_at")) return { rows: [{ id: 42 }] };
+        if (sql.includes("SELECT id FROM rounds WHERE status = 'active'")) return { rows: [] };
+        if (sql.startsWith("UPDATE rounds")) return { rows: [{ id: 42, status: "active" }] };
+        return { rows: [] };
+    });
+    const result = await autoStartEligibleDraftTx(client, new Date("2026-06-01T12:00:00.000Z"));
+    assert.equal(result.id, 42);
+});
+
+test("autoStartEligibleDraftTx yields to an already-active round instead of throwing", async () => {
+    const client = makeMockClient((sql) => {
+        if (sql.includes("WHERE status = 'draft' AND starts_at")) return { rows: [{ id: 42 }] };
+        if (sql.includes("SELECT id FROM rounds WHERE status = 'active'")) return { rows: [{ id: 99 }] };
+        return { rows: [] };
+    });
+    const result = await autoStartEligibleDraftTx(client, new Date("2026-06-01T12:00:00.000Z"));
+    assert.equal(result, null, "another active round wins the race without crashing the sync loop");
+});
+
+test("autoStartEligibleDraftTx never selects a draft whose ends_at has already passed", async () => {
+    // Сам SQL-запрос фильтрует по ends_at > now; этот тест документирует,
+    // что функция не делает отдельной ручной фильтрации, которую можно обойти.
+    const client = makeMockClient((sql, params) => {
+        if (sql.includes("WHERE status = 'draft' AND starts_at")) {
+            assert.match(sql, /ends_at > \$1/);
+            return { rows: [] };
+        }
+        return { rows: [] };
+    });
+    const result = await autoStartEligibleDraftTx(client, new Date());
+    assert.equal(result, null);
 });

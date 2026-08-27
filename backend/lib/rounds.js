@@ -180,6 +180,33 @@ async function startRoundTx(client, roundId) {
     return res.rows[0];
 }
 
+// Находит самый ранний черновик, готовый к запуску по расписанию
+// (starts_at уже наступил, ends_at ещё не прошёл), и атомарно его
+// запускает через startRoundTx - значит действует та же защита от
+// одновременной активации двух раундов (блокировка активной строки +
+// частичный уникальный индекс в БД). Если запускать нечего - вернёт null,
+// а не бросит ошибку, чтобы вызывающий код мог просто продолжить работу.
+async function autoStartEligibleDraftTx(client, now = new Date()) {
+    const eligible = await client.query(
+        `SELECT id FROM rounds
+         WHERE status = 'draft' AND starts_at <= $1 AND ends_at > $1
+         ORDER BY starts_at ASC, id ASC
+         LIMIT 1`,
+        [now]
+    );
+    if (eligible.rows.length === 0) {
+        return null;
+    }
+    try {
+        return await startRoundTx(client, eligible.rows[0].id);
+    } catch (err) {
+        if (err.message === "ANOTHER_ROUND_ACTIVE" || err.message === "ROUND_NOT_DRAFT") {
+            return null;
+        }
+        throw err;
+    }
+}
+
 // Завершает раунд и сохраняет его финальное состояние в архив.
 // Пиксели раунда никогда не удаляются - они остаются в таблице pixels
 // под своим round_id, поэтому финальный холст не может быть потерян.
@@ -228,5 +255,6 @@ module.exports = {
     assertPixelAllowed,
     normalizeRoundPixelImport,
     startRoundTx,
+    autoStartEligibleDraftTx,
     finishRound
 };
