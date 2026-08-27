@@ -183,7 +183,28 @@ async function startRoundTx(client, roundId) {
 // Завершает раунд и сохраняет его финальное состояние в архив.
 // Пиксели раунда никогда не удаляются - они остаются в таблице pixels
 // под своим round_id, поэтому финальный холст не может быть потерян.
-async function finishRound(client, { roundId, preview, pixelCount }) {
+async function finishRound(client, { roundId, preview, pixelCount, buildArchive }) {
+    // Берём эксклюзивную блокировку до рендера финального PNG. Обычная
+    // постановка пикселя берёт FOR SHARE, поэтому завершение ждёт уже
+    // начатые записи, а новые после блокировки будут отклонены.
+    const locked = await client.query(
+        "SELECT * FROM rounds WHERE id = $1 AND status = 'active' FOR UPDATE",
+        [roundId]
+    );
+    if (locked.rows.length === 0) {
+        throw new Error("ROUND_NOT_ACTIVE");
+    }
+
+    if (typeof buildArchive === "function") {
+        const archive = await buildArchive(locked.rows[0], client);
+        preview = archive && archive.preview;
+        pixelCount = archive && archive.pixelCount;
+    }
+
+    if (!preview || !Number.isInteger(pixelCount) || pixelCount < 0) {
+        throw new Error("INVALID_ARCHIVE");
+    }
+
     const res = await client.query(
         "UPDATE rounds SET status = 'finished', finished_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'active' RETURNING *",
         [roundId]
@@ -192,8 +213,8 @@ async function finishRound(client, { roundId, preview, pixelCount }) {
         throw new Error("ROUND_NOT_ACTIVE");
     }
     await client.query(
-        `INSERT INTO round_archives (round_id, preview, pixel_count) VALUES ($1, $2, $3)
-         ON CONFLICT (round_id) DO UPDATE SET preview = EXCLUDED.preview, pixel_count = EXCLUDED.pixel_count, created_at = CURRENT_TIMESTAMP`,
+        "INSERT INTO round_archives (round_id, preview, pixel_count) VALUES ($1, $2, $3) " +
+        "ON CONFLICT (round_id) DO UPDATE SET preview = EXCLUDED.preview, pixel_count = EXCLUDED.pixel_count, created_at = CURRENT_TIMESTAMP",
         [roundId, preview, pixelCount]
     );
     return res.rows[0];
