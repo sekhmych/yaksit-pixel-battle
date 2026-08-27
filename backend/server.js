@@ -644,10 +644,21 @@ io.on("connection", async (socket) => {
                 // снимок ждёт все начатые размещения, а после завершения новые
                 // транзакции уже не увидят active-раунд.
                 const activeCheck = await client.query(
-                    "SELECT id FROM rounds WHERE id = $1 AND status = 'active' FOR SHARE",
+                    "SELECT id, status, canvas_size, palette FROM rounds WHERE id = $1 AND status = 'active' FOR SHARE",
                     [round.id]
                 );
                 if (activeCheck.rows.length === 0) return false;
+
+                // Палитра читается из той же заблокированной строки БД, а не
+                // только из in-memory-кэша: изменение палитры нельзя обойти
+                // гонкой между UPDATE rounds и обновлением roundState.
+                const databaseAllowed = assertPixelAllowed({
+                    activeRound: activeCheck.rows[0],
+                    x,
+                    y,
+                    color
+                });
+                if (!databaseAllowed.ok) return false;
 
                 await client.query(
                     "INSERT INTO pixels (round_id, x, y, color, user_id) VALUES ($1, $2, $3, $4, $5) " +
