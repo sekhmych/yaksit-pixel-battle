@@ -196,6 +196,18 @@ async function startTestServer(options = {}) {
     child.stderr.on("data", (d) => { stderr += d.toString(); });
     child.stdout.on("data", (d) => { stdout += d.toString(); });
 
+    // Единственное место, где фиксируется факт и подробности выхода
+    // дочернего процесса - используется и waitForExit(), и stop(), чтобы не
+    // пытаться убить уже завершившийся процесс (SIGTERM/SIGKILL по мёртвому
+    // pid либо no-op, либо ошибка ESRCH).
+    let exitInfo = null;
+    const exitPromise = new Promise((resolve) => {
+        child.once("exit", (code, signal) => {
+            exitInfo = { code, signal };
+            resolve(exitInfo);
+        });
+    });
+
     try {
         await waitForHealth(baseUrl);
     } catch (err) {
@@ -211,15 +223,50 @@ async function startTestServer(options = {}) {
         port,
         dbName,
         pool,
+        child,
         getLogs: () => ({ stdout, stderr }),
-        async stop() {
+        getExitInfo: () => exitInfo,
+        // Отправляет сигнал дочернему процессу напрямую - используется
+        // тестами graceful shutdown, которым нужен полный контроль над
+        // моментом отправки SIGTERM/SIGINT (в отличие от stop(), который
+        // сам решает, когда и как останавливать сервер при уборке теста).
+        // No-op, если процесс уже завершился.
+        signal(sig = "SIGTERM") {
+            if (exitInfo) return;
+            child.kill(sig);
+        },
+        // Ждёт реального завершения процесса (а не просто HTTP-ответа) и
+        // возвращает { code, signal } - тесты используют это, чтобы отличить
+        // штатный graceful-выход (code === 0, signal === null) от
+        // принудительного (SIGKILL fallback ниже, или ненулевой exit code
+        // при неудавшемся graceful shutdown).
+        waitForExit(timeoutMs = 20000) {
+            if (exitInfo) return Promise.resolve(exitInfo);
+            return Promise.race([
+                exitPromise,
+                new Promise((_, reject) => setTimeout(
+                    () => reject(new Error(`Процесс не завершился за ${timeoutMs}мс`)),
+                    timeoutMs
+                ))
+            ]);
+        },
+        // Даёт серверу шанс на настоящий graceful SIGTERM-выход (теперь,
+        // когда он есть) и только если тот не укладывается в отведённое
+        // время - принудительно добивает SIGKILL. Жёсткий SIGKILL остаётся
+        // только аварийным fallback самого test harness, а не основным
+        // способом остановки.
+        async stop({ forceKillAfterMs = 10000 } = {}) {
             await pool.end().catch(() => {});
-            await new Promise((resolve) => {
-                child.once("exit", resolve);
-                child.kill("SIGTERM");
-                const forceKill = setTimeout(() => child.kill("SIGKILL"), 3000);
-                forceKill.unref();
-            });
+            if (!exitInfo) {
+                await new Promise((resolve) => {
+                    child.kill("SIGTERM");
+                    const forceKill = setTimeout(() => {
+                        if (!exitInfo) child.kill("SIGKILL");
+                    }, forceKillAfterMs);
+                    forceKill.unref();
+                    exitPromise.then(resolve);
+                });
+            }
             if (dropOnStop) {
                 await dropTestDatabase(dbName).catch(() => {});
             }

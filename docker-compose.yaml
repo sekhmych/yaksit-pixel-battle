@@ -11,8 +11,12 @@ services:
     ports:
       - "8888:3000"
     restart: unless-stopped
+    # Больше, чем SHUTDOWN_TIMEOUT_MS (по умолчанию 15с) - иначе Docker
+    # пошлёт SIGKILL раньше, чем приложение успеет доиграть/дождаться уже
+    # начатых игровых операций и корректно закрыть Postgres.
+    stop_grace_period: 20s
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health >/dev/null || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/ready >/dev/null || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
