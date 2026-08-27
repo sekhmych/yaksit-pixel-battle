@@ -31,6 +31,11 @@ const {
     autoStartEligibleDraftTx,
     finishRound
 } = require("./lib/rounds");
+const {
+    serializeBackup,
+    validateBackup,
+    restoreBackupTx
+} = require("./lib/backup");
 
 // === ГЛОБАЛЬНЫЕ ОБРАБОТЧИКИ ОШИБОК ===
 process.on('uncaughtException', (err) => {
@@ -51,6 +56,15 @@ const server = http.createServer(app);
 const ROUND_SYNC_INTERVAL_MS = Number(process.env.ROUND_SYNC_INTERVAL_MS) > 0
     ? Number(process.env.ROUND_SYNC_INTERVAL_MS)
     : 15000;
+
+// Максимальный размер JSON-файла полного игрового бэкапа при восстановлении
+// (в байтах). Не входит в обязательную конфигурацию - есть безопасное
+// значение по умолчанию. Ограничивает и HTTP body-parser, и валидацию.
+const BACKUP_MAX_BYTES = Number(process.env.BACKUP_MAX_BYTES) > 0
+    ? Number(process.env.BACKUP_MAX_BYTES)
+    : 50 * 1024 * 1024; // 50 MB
+
+const BACKUP_RESTORE_PATH = "/admin/backup/restore";
 
 // Дефолтная палитра для архивного раунда, создаваемого при миграции
 // старого (до системы раундов) холста, чтобы не потерять его историю.
@@ -94,8 +108,18 @@ app.use(helmet({
 }));
 
 // 3. Базовые парсеры
-app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
+// Эндпоинт восстановления бэкапа сам ставит себе увеличенный лимит на тело
+// запроса (BACKUP_MAX_BYTES) - остальные маршруты остаются под стандартным
+// лимитом body-parser'а, поэтому именно для этого пути глобальные парсеры
+// пропускаются.
+app.use((req, res, next) => {
+    if (req.method === "POST" && req.path === BACKUP_RESTORE_PATH) return next();
+    express.json()(req, res, next);
+});
+app.use((req, res, next) => {
+    if (req.method === "POST" && req.path === BACKUP_RESTORE_PATH) return next();
+    express.urlencoded({ extended: false })(req, res, next);
+});
 app.use(cookieParser(SESSION_SECRET));
 
 // 4. Подключение к БД
@@ -201,12 +225,6 @@ const noCache = (req, res, next) => {
     next();
 };
 
-// Обработчик CSRF ошибок
-app.use((err, req, res, next) => {
-    if (err.code !== 'EBADCSRFTOKEN') return next(err);
-    res.status(403).send('Ошибка безопасности: CSRF-токен невалиден. Пожалуйста, обновите страницу.');
-});
-
 // === СОСТОЯНИЕ РАУНДОВ ===
 //
 // roundState.active   - раунд со статусом 'active' (рисование разрешено), либо null.
@@ -217,6 +235,94 @@ app.use((err, req, res, next) => {
 let roundState = { active: null, view: null, upcoming: null };
 const finishingRoundIds = new Set();
 const onlineUserIds = new Map(); // socket.id -> userId, для подсчёта онлайна
+
+// Глобальный режим обслуживания на время восстановления бэкапа.
+//
+// socket.use ниже отсекает НОВЫЕ Socket.IO-события с понятной ошибкой, пока
+// maintenanceMode включён - это дешёвый быстрый путь, но НЕ единственная
+// защита: если операция уже прошла эту проверку и начала асинхронную
+// работу, одного флага недостаточно - она может закоммититься уже ПОСЛЕ
+// того, как restore восстановил данные, и молча испортить их. Поэтому
+// каждая функция, которая пишет в игровые таблицы (rounds/pixels/
+// pixel_history/snapshots/round_archives), обязана сама войти через
+// enterGameOp()/withGameOp() в самом начале своей работы (до первого
+// await, синхронно) - если maintenanceMode уже включён, вход бросает
+// понятную ошибку немедленно; если ещё нет - операция учитывается
+// счётчиком activeGameOps, и restore перед стартом транзакции дождётся,
+// пока счётчик не опустится до нуля (closeGameOpsForMaintenance).
+let maintenanceMode = false;
+let activeGameOps = 0;
+let gameOpsDrainWaiters = [];
+
+// Только для интеграционных тестов: искусственная задержка внутри уже
+// начатой игровой операции, чтобы надёжно и без гонок с реальным временем
+// проверить, что restore действительно дожидается таких операций. В
+// production переменная не задаётся, поэтому задержка всегда 0 и код ведёт
+// себя как раньше.
+const TEST_GAME_OP_DELAY_MS = Number(process.env.TEST_GAME_OP_DELAY_MS) || 0;
+
+// Только для интеграционных тестов: задержка, вставляемая ровно между
+// коммитом записи в БД и последующей перезагрузкой roundState/рассылкой
+// событий внутри одной и той же игровой операции. Нужна, чтобы доказать,
+// что restore ждёт не только сам SQL-запрос, а весь жизненный цикл
+// операции - включая actualization/рассылку игрового состояния. В
+// production переменная не задаётся, поэтому задержки нет.
+const TEST_GAME_OP_POST_DB_DELAY_MS = Number(process.env.TEST_GAME_OP_POST_DB_DELAY_MS) || 0;
+async function testPostDbDelay() {
+    if (TEST_GAME_OP_POST_DB_DELAY_MS > 0) await sleep(TEST_GAME_OP_POST_DB_DELAY_MS);
+}
+
+const MAINTENANCE_BLOCKED_EVENTS = new Set([
+    "set_pixel", "delete_pixel", "clear_canvas",
+    "create_round", "update_round", "start_round", "finish_round", "delete_round",
+    "export_database", "import_database", "rollback_area", "create_manual_snapshot",
+    "create_moderator", "delete_moderator", "update_moderator_password"
+]);
+
+// Синхронно проверяет и регистрирует начало игровой операции. Между
+// проверкой maintenanceMode и инкрементом activeGameOps нет await -
+// значит нет и окна для гонки с closeGameOpsForMaintenance().
+function enterGameOp() {
+    if (maintenanceMode) {
+        throw new Error("MAINTENANCE_MODE");
+    }
+    activeGameOps++;
+}
+
+function exitGameOp() {
+    activeGameOps--;
+    if (maintenanceMode && activeGameOps === 0) {
+        const waiters = gameOpsDrainWaiters;
+        gameOpsDrainWaiters = [];
+        waiters.forEach(resolve => resolve());
+    }
+}
+
+// Оборачивает игровую операцию: enterGameOp() перед вызовом, exitGameOp()
+// гарантированно после - даже если fn бросит исключение.
+async function withGameOp(fn) {
+    enterGameOp();
+    try {
+        if (TEST_GAME_OP_DELAY_MS > 0) await sleep(TEST_GAME_OP_DELAY_MS);
+        return await fn();
+    } finally {
+        exitGameOp();
+    }
+}
+
+// Вызывается restore перед началом транзакции: синхронно закрывает вход
+// для новых игровых мутаций (после этой строки enterGameOp() везде уже
+// бросает MAINTENANCE_MODE), затем дожидается, пока все уже начатые
+// операции не завершатся сами.
+async function closeGameOpsForMaintenance() {
+    maintenanceMode = true;
+    if (activeGameOps === 0) return;
+    await new Promise((resolve) => { gameOpsDrainWaiters.push(resolve); });
+}
+
+function reopenGameOps() {
+    maintenanceMode = false;
+}
 
 function publicRound(row) {
     if (!row) return null;
@@ -311,6 +417,15 @@ async function renderCanvasPreview(queryable, round) {
 
 // Блокирует активный раунд, собирает его финальный PNG и только затем
 // переводит его в finished. Это делает превью и число пикселей согласованными.
+//
+// Не оборачивает сама себя в withGameOp() - её вызывают и ручной finish_round,
+// и автозавершение по расписанию, а каждый из них должен держать gate
+// открытым не только на время этого SQL, но и до своей последующей
+// перезагрузки roundState и рассылки событий (иначе operation считалась бы
+// завершённой раньше, чем реально разослано новое состояние). Поэтому
+// withGameOp() вызывается один раз в самих вызывающих функциях, а не здесь -
+// это исключает как вложенный (двойной) вход в gate, так и окно между
+// коммитом транзакции и рассылкой.
 async function finishAndArchiveRound(roundId) {
     return withTransaction(pool, (client) => finishRound(client, {
         roundId,
@@ -342,14 +457,26 @@ async function bulkInsertPixels(client, roundId, pixels) {
 
 // === ФОНОВЫЕ ЗАДАЧИ ===
 
+// enterGameOp() вызывается ДО try - если maintenanceMode уже включён, исключение
+// MAINTENANCE_MODE должно долететь до вызывающего (интервала/create_manual_snapshot)
+// не будучи проглоченным этим же catch.
 async function takeSnapshot() {
     const round = roundState.active;
     if (!round) return;
+    enterGameOp();
     try {
         const buffer = await renderCanvasPreview(pool, round);
         await pool.query("INSERT INTO snapshots (round_id, data) VALUES ($1, $2)", [round.id, buffer]);
         console.log(`[Snapshot] Раунд #${round.id}: снимок холста сохранён (${round.canvas_size}x${round.canvas_size})`);
-    } catch (err) { console.error("Snapshot error:", err); }
+    } catch (err) {
+        console.error("Snapshot error:", err);
+    } finally {
+        exitGameOp();
+    }
+}
+
+function isMaintenanceError(err) {
+    return err && err.message === "MAINTENANCE_MODE";
 }
 
 async function autoFinishExpiredRound() {
@@ -358,15 +485,22 @@ async function autoFinishExpiredRound() {
 
     finishingRoundIds.add(round.id);
     try {
-        const finished = await finishAndArchiveRound(round.id);
+        // Gate остаётся открытым для этой операции вплоть до перезагрузки
+        // roundState и рассылки init_data - только тогда restore может быть
+        // уверен, что больше никто не разошлёт устаревшее игровое состояние.
+        const finished = await withGameOp(async () => {
+            const f = await finishAndArchiveRound(round.id);
+            await testPostDbDelay();
+            roundState = await loadRoundState();
+            io.emit("init_data", await buildPublicInitPayload());
+            io.to("admins").emit("admin_rounds_changed");
+            return f;
+        });
         await logAdminAction("AUTO_FINISH_ROUND", { roundId: finished.id, name: finished.name });
-        roundState = await loadRoundState();
-        io.emit("init_data", await buildPublicInitPayload());
-        io.to("admins").emit("admin_rounds_changed");
         console.log("[Rounds] Раунд #" + finished.id + " автоматически завершён по истечении времени");
         return true;
     } catch (err) {
-        console.error("Auto-finish error:", err);
+        if (!isMaintenanceError(err)) console.error("Auto-finish error:", err);
         return false;
     } finally {
         finishingRoundIds.delete(round.id);
@@ -378,16 +512,21 @@ async function autoStartEligibleDraft() {
     // перечитываем актуальное значение, а не полагаемся на устаревший кэш.
     if (roundState.active) return false;
     try {
-        const started = await withTransaction(pool, (client) => autoStartEligibleDraftTx(client));
+        const started = await withGameOp(async () => {
+            const s = await withTransaction(pool, (client) => autoStartEligibleDraftTx(client));
+            if (!s) return null;
+            await testPostDbDelay();
+            roundState = await loadRoundState();
+            io.emit("init_data", await buildPublicInitPayload());
+            io.to("admins").emit("admin_rounds_changed");
+            return s;
+        });
         if (!started) return false;
         await logAdminAction("AUTO_START_ROUND", { roundId: started.id, name: started.name });
-        roundState = await loadRoundState();
-        io.emit("init_data", await buildPublicInitPayload());
-        io.to("admins").emit("admin_rounds_changed");
         console.log("[Rounds] Раунд #" + started.id + " автоматически запущен по расписанию");
         return true;
     } catch (err) {
-        console.error("Auto-start error:", err);
+        if (!isMaintenanceError(err)) console.error("Auto-start error:", err);
         return false;
     }
 }
@@ -397,17 +536,20 @@ async function autoStartEligibleDraft() {
 // запускаем самый ранний подходящий черновик. Порядок важен - иначе только
 // что истёкший раунд мог бы на мгновение помешать запуску следующего.
 async function synchronizeRounds() {
+    if (maintenanceMode) return;
     await autoFinishExpiredRound();
     await autoStartEligibleDraft();
 }
 
-setInterval(takeSnapshot, 10 * 60 * 1000); // Снимок каждые 10 минут
+setInterval(() => { takeSnapshot().catch(() => { /* уже обработано внутри takeSnapshot */ }); }, 10 * 60 * 1000); // Снимок каждые 10 минут
 setInterval(synchronizeRounds, ROUND_SYNC_INTERVAL_MS); // Автозавершение + автозапуск по расписанию
 setInterval(async () => {
     try {
-        await pool.query("DELETE FROM pixel_history WHERE created_at < NOW() - INTERVAL '48 hours'");
+        await withGameOp(() => pool.query("DELETE FROM pixel_history WHERE created_at < NOW() - INTERVAL '48 hours'"));
         console.log("[Cleanup] Старая история удалена");
-    } catch (err) { console.error("Cleanup error:", err); }
+    } catch (err) {
+        if (!isMaintenanceError(err)) console.error("Cleanup error:", err);
+    }
 }, 60 * 60 * 1000); // Очистка каждый час
 
 function sendHtmlWithContext(res, filePath, csrfToken = null) {
@@ -470,6 +612,121 @@ app.get("/admin/download-timelapse", async (req, res) => {
     } catch (err) {
         console.error("Zip error:", err);
         res.status(500).send("Error creating archive");
+    }
+});
+
+function requireAdmin(req, res, next) {
+    if (!req.isAuthenticated() || req.user.role !== 'admin') {
+        return res.status(403).json({ success: false, error: "Access Denied" });
+    }
+    next();
+}
+
+// Полный логический бэкап ИГРОВЫХ данных (раунды/пиксели/история/снимки/
+// архивы) - НЕ pg_dump, НЕ сессии/модераторы/пароли/секреты. Читается из
+// одного согласованного snapshot БД (REPEATABLE READ), чтобы связанные
+// таблицы не оказались от разных моментов времени.
+app.get("/admin/backup/export", requireAdmin, noCache, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+        const [rounds, pixels, pixelHistory, snapshots, roundArchives] = await Promise.all([
+            client.query("SELECT * FROM rounds ORDER BY id"),
+            client.query("SELECT * FROM pixels ORDER BY round_id, x, y"),
+            client.query("SELECT * FROM pixel_history ORDER BY id"),
+            client.query("SELECT * FROM snapshots ORDER BY id"),
+            client.query("SELECT * FROM round_archives ORDER BY round_id")
+        ]);
+        await client.query("COMMIT");
+
+        const backup = serializeBackup({
+            rounds: rounds.rows,
+            pixels: pixels.rows,
+            pixelHistory: pixelHistory.rows,
+            snapshots: snapshots.rows,
+            roundArchives: roundArchives.rows
+        });
+
+        // Экспорт должен быть симметричен импорту: если сериализованный бэкап
+        // сам не пройдёт лимит BACKUP_MAX_BYTES при восстановлении, мы не
+        // должны отдавать его на скачивание - сервер бы выдал файл, который
+        // сам же не смог бы восстановить.
+        const json = JSON.stringify(backup);
+        const byteLength = Buffer.byteLength(json, "utf8");
+        if (byteLength > BACKUP_MAX_BYTES) {
+            console.error(`Backup export too large: ${byteLength} bytes > BACKUP_MAX_BYTES=${BACKUP_MAX_BYTES}`);
+            return res.status(413).json({
+                success: false,
+                error: `Бэкап (${byteLength} байт) превышает BACKUP_MAX_BYTES (${BACKUP_MAX_BYTES} байт). Увеличьте лимит через переменную окружения BACKUP_MAX_BYTES, чтобы разрешить экспорт и восстановление бэкапов такого размера.`
+            });
+        }
+
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        res.setHeader("Content-Type", "application/json");
+        res.setHeader("Content-Disposition", `attachment; filename="yaksit-pixel-battle-game-backup-${stamp}.json"`);
+        res.send(json);
+        await logAdminAction("EXPORT_GAME_BACKUP", {
+            user: req.user.id,
+            rounds: rounds.rowCount,
+            pixels: pixels.rowCount,
+            pixelHistory: pixelHistory.rowCount,
+            snapshots: snapshots.rowCount,
+            roundArchives: roundArchives.rowCount,
+            byteLength
+        });
+    } catch (err) {
+        console.error("Backup export error:", err);
+        try { await client.query("ROLLBACK"); } catch (_) { /* no-op */ }
+        res.status(500).json({ success: false, error: "Server error" });
+    } finally {
+        client.release();
+    }
+});
+
+// Восстановление игровых данных из бэкапа. Полностью заменяет rounds/
+// pixels/pixel_history/snapshots/round_archives проверенным содержимым
+// файла; session/moderators/users/settings/admin_logs не затрагиваются.
+app.post(BACKUP_RESTORE_PATH, requireAdmin, csrfProtection, express.json({ limit: BACKUP_MAX_BYTES }), async (req, res) => {
+    const contentLength = Number(req.headers["content-length"]);
+    const validated = validateBackup(req.body, {
+        maxBytes: BACKUP_MAX_BYTES,
+        rawByteLength: Number.isFinite(contentLength) && contentLength > 0 ? contentLength : undefined
+    });
+    if (!validated.ok) {
+        return res.status(400).json({ success: false, error: validated.error });
+    }
+
+    if (maintenanceMode) {
+        return res.status(409).json({ success: false, error: "Восстановление уже выполняется." });
+    }
+
+    // Закрываем вход для новых игровых мутаций синхронно (внутри
+    // closeGameOpsForMaintenance maintenanceMode=true выставляется до первого
+    // await), затем дожидаемся уже начатых операций - только после этого
+    // безопасно стартовать транзакцию восстановления. Вход остаётся закрытым
+    // до перезагрузки roundState и рассылки init_data, чтобы ни одна
+    // параллельная операция не могла подмешать устаревшие данные между
+    // COMMIT восстановления и обновлением состояния сервера.
+    await closeGameOpsForMaintenance();
+    try {
+        const summary = await withTransaction(pool, (client) => restoreBackupTx(client, validated.value));
+
+        roundState = await loadRoundState();
+        io.emit("init_data", await buildPublicInitPayload());
+        io.to("admins").emit("admin_rounds_changed");
+
+        await logAdminAction("RESTORE_GAME_BACKUP", {
+            user: req.user.id,
+            exportedAt: validated.value.exportedAt,
+            ...summary
+        });
+
+        res.json({ success: true, summary });
+    } catch (err) {
+        console.error("Backup restore error:", err);
+        res.status(500).json({ success: false, error: "Не удалось восстановить бэкап - изменения отменены." });
+    } finally {
+        reopenGameOps();
     }
 });
 
@@ -578,6 +835,25 @@ app.get("/api/rounds/archive/:id/preview.png", async (req, res) => {
 
 app.use(express.static(path.join(__dirname, "public"), { index: false }));
 
+// Обработчик CSRF- и body-parser-ошибок. Должен идти ПОСЛЕ всех маршрутов:
+// Express ищет error-handling middleware, продолжая обход стека вперёд от
+// точки, где случилась ошибка, а не с начала - если зарегистрировать этот
+// обработчик раньше самих маршрутов, он никогда не будет достигнут и клиент
+// получит дефолтную страницу ошибки Express со стектрейсом.
+app.use((err, req, res, next) => {
+    if (err.code === 'EBADCSRFTOKEN') {
+        return res.status(403).send('Ошибка безопасности: CSRF-токен невалиден. Пожалуйста, обновите страницу.');
+    }
+    if (err.type === 'entity.too.large' || err.status === 413) {
+        return res.status(413).json({ success: false, error: 'Файл превышает допустимый размер.' });
+    }
+    if (err.type === 'entity.parse.failed') {
+        return res.status(400).json({ success: false, error: 'Невалидный JSON.' });
+    }
+    console.error("Unhandled request error:", err);
+    return res.status(500).json({ success: false, error: 'Внутренняя ошибка сервера.' });
+});
+
 // === SOCKET.IO ===
 
 const io = new Server(server, {
@@ -617,6 +893,11 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 io.on("connection", async (socket) => {
     socket.use(([event, ...args], next) => {
+        if (maintenanceMode && MAINTENANCE_BLOCKED_EVENTS.has(event)) {
+            const ack = args[args.length - 1];
+            if (typeof ack === "function") ack({ success: false, error: "Идёт восстановление игровых данных, подождите и попробуйте снова." });
+            return;
+        }
         if (socket.isAdmin) return next();
         const now = Date.now();
         const rate = messageRates.get(socket.id) || { count: 0, startTime: now };
@@ -678,61 +959,73 @@ io.on("connection", async (socket) => {
                 placementLocked = true;
             }
 
-            const placed = await withTransaction(pool, async (client) => {
-                if (finishingRoundIds.has(round.id)) return false;
+            // Gate охватывает не только запись в БД, но и последующую
+            // актуализацию in-memory round.pixelsPlaced/roundState.view и
+            // рассылку pixel_update/round_stats - иначе restore могло бы
+            // посчитать операцию завершённой сразу после COMMIT, разослать
+            // свой init_data, а следом полетел бы устаревший pixel_update от
+            // этой же операции.
+            const result = await withGameOp(async () => {
+                const placed = await withTransaction(pool, async (client) => {
+                    if (finishingRoundIds.has(round.id)) return false;
 
-                // finishRound берёт FOR UPDATE на ту же строку. Значит финальный
-                // снимок ждёт все начатые размещения, а после завершения новые
-                // транзакции уже не увидят active-раунд.
-                const activeCheck = await client.query(
-                    "SELECT id, status, canvas_size, palette FROM rounds WHERE id = $1 AND status = 'active' FOR SHARE",
-                    [round.id]
-                );
-                if (activeCheck.rows.length === 0) return false;
+                    // finishRound берёт FOR UPDATE на ту же строку. Значит финальный
+                    // снимок ждёт все начатые размещения, а после завершения новые
+                    // транзакции уже не увидят active-раунд.
+                    const activeCheck = await client.query(
+                        "SELECT id, status, canvas_size, palette FROM rounds WHERE id = $1 AND status = 'active' FOR SHARE",
+                        [round.id]
+                    );
+                    if (activeCheck.rows.length === 0) return false;
 
-                // Палитра читается из той же заблокированной строки БД, а не
-                // только из in-memory-кэша: изменение палитры нельзя обойти
-                // гонкой между UPDATE rounds и обновлением roundState.
-                const databaseAllowed = assertPixelAllowed({
-                    activeRound: activeCheck.rows[0],
-                    x,
-                    y,
-                    color
+                    // Палитра читается из той же заблокированной строки БД, а не
+                    // только из in-memory-кэша: изменение палитры нельзя обойти
+                    // гонкой между UPDATE rounds и обновлением roundState.
+                    const databaseAllowed = assertPixelAllowed({
+                        activeRound: activeCheck.rows[0],
+                        x,
+                        y,
+                        color
+                    });
+                    if (!databaseAllowed.ok) return false;
+
+                    await client.query(
+                        "INSERT INTO pixels (round_id, x, y, color, user_id) VALUES ($1, $2, $3, $4, $5) " +
+                        "ON CONFLICT (round_id, x, y) DO UPDATE SET color = EXCLUDED.color, user_id = EXCLUDED.user_id, updated_at = CURRENT_TIMESTAMP",
+                        [round.id, x, y, color, userId]
+                    );
+                    await client.query(
+                        "INSERT INTO pixel_history (round_id, x, y, color, user_id) VALUES ($1, $2, $3, $4, $5)",
+                        [round.id, x, y, color, userId]
+                    );
+                    return true;
                 });
-                if (!databaseAllowed.ok) return false;
+                if (!placed) return { placed: false };
+                await testPostDbDelay();
 
-                await client.query(
-                    "INSERT INTO pixels (round_id, x, y, color, user_id) VALUES ($1, $2, $3, $4, $5) " +
-                    "ON CONFLICT (round_id, x, y) DO UPDATE SET color = EXCLUDED.color, user_id = EXCLUDED.user_id, updated_at = CURRENT_TIMESTAMP",
-                    [round.id, x, y, color, userId]
-                );
-                await client.query(
-                    "INSERT INTO pixel_history (round_id, x, y, color, user_id) VALUES ($1, $2, $3, $4, $5)",
-                    [round.id, x, y, color, userId]
-                );
-                return true;
+                if (!socket.canEditCanvas) {
+                    userCooldowns.set(userId, now);
+                    await pool.query(
+                        "INSERT INTO users (user_id, last_placed_at) VALUES ($1, $2) " +
+                        "ON CONFLICT (user_id) DO UPDATE SET last_placed_at = EXCLUDED.last_placed_at",
+                        [userId, now]
+                    );
+                }
+
+                round.pixelsPlaced = (round.pixelsPlaced || 0) + 1;
+                if (roundState.view && roundState.view.id === round.id) roundState.view.pixelsPlaced = round.pixelsPlaced;
+
+                io.emit("pixel_update", { x, y, color, userId });
+                io.emit("round_stats", { roundId: round.id, pixelsPlaced: round.pixelsPlaced });
+                return { placed: true };
             });
-            if (!placed) return;
+            if (!result.placed) return;
 
-            if (!socket.canEditCanvas) {
-                userCooldowns.set(userId, now);
-                await pool.query(
-                    "INSERT INTO users (user_id, last_placed_at) VALUES ($1, $2) " +
-                    "ON CONFLICT (user_id) DO UPDATE SET last_placed_at = EXCLUDED.last_placed_at",
-                    [userId, now]
-                );
-            }
-
-            round.pixelsPlaced = (round.pixelsPlaced || 0) + 1;
-            if (roundState.view && roundState.view.id === round.id) roundState.view.pixelsPlaced = round.pixelsPlaced;
-
-            io.emit("pixel_update", { x, y, color, userId });
-            io.emit("round_stats", { roundId: round.id, pixelsPlaced: round.pixelsPlaced });
             if (socket.canEditCanvas) {
                 await logAdminAction("SET_PIXEL", { user: userId, x, y, color, role: socket.isAdmin ? 'admin' : 'moderator' });
             }
         } catch (err) {
-            console.error(err);
+            if (!isMaintenanceError(err)) console.error(err);
         } finally {
             if (placementLocked) userPlacementsInFlight.delete(userId);
         }
@@ -749,10 +1042,13 @@ io.on("connection", async (socket) => {
             !isValidCoordinate(y, round.canvas_size)
         ) return;
         try {
-            await pool.query("DELETE FROM pixels WHERE round_id = $1 AND x = $2 AND y = $3", [round.id, x, y]);
+            await withGameOp(async () => {
+                await pool.query("DELETE FROM pixels WHERE round_id = $1 AND x = $2 AND y = $3", [round.id, x, y]);
+                await testPostDbDelay();
+                io.emit("pixel_deleted", { x, y });
+            });
             await logAdminAction("DELETE_PIXEL", { user: userId, x, y, role: socket.isAdmin ? 'admin' : 'moderator' });
-            io.emit("pixel_deleted", { x, y });
-        } catch (err) { console.error(err); }
+        } catch (err) { if (!isMaintenanceError(err)) console.error(err); }
     });
 
     // === УПРАВЛЕНИЕ МОДЕРАТОРАМИ ===
@@ -816,10 +1112,13 @@ io.on("connection", async (socket) => {
     socket.on("create_manual_snapshot", async (payload, callback) => {
         if (!socket.isAdmin || !verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
         try {
+            // takeSnapshot() сам входит через enterGameOp/exitGameOp.
             await takeSnapshot();
             await logAdminAction("MANUAL_SNAPSHOT", { user: userId });
             if (typeof callback === 'function') callback({ success: true });
-        } catch (err) { if (typeof callback === 'function') callback({ success: false }); }
+        } catch (err) {
+            if (typeof callback === 'function') callback({ success: false, error: isMaintenanceError(err) ? "Идёт восстановление игровых данных, подождите и попробуйте снова." : undefined });
+        }
     });
 
     socket.on("clear_canvas", async (payload, callback) => {
@@ -827,12 +1126,18 @@ io.on("connection", async (socket) => {
         const round = roundState.active;
         if (!round) return callback && callback({ success: false, error: "Нет активного раунда" });
         try {
-            await pool.query("DELETE FROM pixels WHERE round_id = $1", [round.id]);
+            await withGameOp(async () => {
+                await pool.query("DELETE FROM pixels WHERE round_id = $1", [round.id]);
+                await testPostDbDelay();
+                round.pixelsPlaced = 0;
+                io.emit("canvas_cleared");
+            });
             await logAdminAction("CLEAR_CANVAS", { user: userId, roundId: round.id });
-            round.pixelsPlaced = 0;
-            io.emit("canvas_cleared");
             if (typeof callback === 'function') callback({ success: true });
-        } catch (err) { console.error(err); if (typeof callback === 'function') callback({ success: false }); }
+        } catch (err) {
+            if (!isMaintenanceError(err)) console.error(err);
+            if (typeof callback === 'function') callback({ success: false, error: isMaintenanceError(err) ? "Идёт восстановление игровых данных, подождите и попробуйте снова." : undefined });
+        }
     });
 
     // === УПРАВЛЕНИЕ РАУНДАМИ ===
@@ -851,17 +1156,24 @@ io.on("connection", async (socket) => {
         if (!normalized.ok) return callback && callback({ success: false, error: normalized.error });
         const v = normalized.value;
         try {
-            const res = await pool.query(
-                `INSERT INTO rounds (name, description, status, starts_at, ends_at, canvas_size, cooldown, bg_color, grid_enabled, palette)
-                 VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-                [v.name, v.description, v.starts_at, v.ends_at, v.canvas_size, v.cooldown, v.bg_color, v.grid_enabled, JSON.stringify(v.palette)]
-            );
-            await logAdminAction("CREATE_ROUND", { user: userId, roundId: res.rows[0].id, name: v.name });
-            roundState = await loadRoundState();
-            io.to("admins").emit("admin_rounds_changed");
-            if (roundState.upcoming) io.emit("round_updated", { upcoming: publicUpcoming(roundState.upcoming) });
-            if (typeof callback === 'function') callback({ success: true, round: publicRound(res.rows[0]) });
-        } catch (err) { console.error(err); if (typeof callback === 'function') callback({ success: false, error: "Server error" }); }
+            const row = await withGameOp(async () => {
+                const res = await pool.query(
+                    `INSERT INTO rounds (name, description, status, starts_at, ends_at, canvas_size, cooldown, bg_color, grid_enabled, palette)
+                     VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+                    [v.name, v.description, v.starts_at, v.ends_at, v.canvas_size, v.cooldown, v.bg_color, v.grid_enabled, JSON.stringify(v.palette)]
+                );
+                await testPostDbDelay();
+                roundState = await loadRoundState();
+                io.to("admins").emit("admin_rounds_changed");
+                if (roundState.upcoming) io.emit("round_updated", { upcoming: publicUpcoming(roundState.upcoming) });
+                return res.rows[0];
+            });
+            await logAdminAction("CREATE_ROUND", { user: userId, roundId: row.id, name: v.name });
+            if (typeof callback === 'function') callback({ success: true, round: publicRound(row) });
+        } catch (err) {
+            if (!isMaintenanceError(err)) console.error(err);
+            if (typeof callback === 'function') callback({ success: false, error: isMaintenanceError(err) ? "Идёт восстановление игровых данных, подождите и попробуйте снова." : "Server error" });
+        }
     });
 
     socket.on("update_round", async (payload, callback) => {
@@ -892,26 +1204,31 @@ io.on("connection", async (socket) => {
             if (!normalized.ok) return callback && callback({ success: false, error: normalized.error });
             const v = normalized.value;
 
-            const res = await pool.query(
-                `UPDATE rounds SET name = $1, description = $2, starts_at = $3, ends_at = $4, canvas_size = $5,
-                    cooldown = $6, bg_color = $7, grid_enabled = $8, palette = $9
-                 WHERE id = $10 RETURNING *`,
-                [v.name, v.description, v.starts_at, v.ends_at, v.canvas_size, v.cooldown, v.bg_color, v.grid_enabled, JSON.stringify(v.palette), roundId]
-            );
-            const updated = res.rows[0];
+            const updated = await withGameOp(async () => {
+                const res = await pool.query(
+                    `UPDATE rounds SET name = $1, description = $2, starts_at = $3, ends_at = $4, canvas_size = $5,
+                        cooldown = $6, bg_color = $7, grid_enabled = $8, palette = $9
+                     WHERE id = $10 RETURNING *`,
+                    [v.name, v.description, v.starts_at, v.ends_at, v.canvas_size, v.cooldown, v.bg_color, v.grid_enabled, JSON.stringify(v.palette), roundId]
+                );
+                await testPostDbDelay();
+                roundState = await loadRoundState();
+                io.to("admins").emit("admin_rounds_changed");
+
+                if (roundState.active && roundState.active.id === roundId) {
+                    io.emit("round_updated", { round: publicRound(roundState.active) });
+                } else if (roundState.upcoming && roundState.upcoming.id === roundId) {
+                    io.emit("round_updated", { upcoming: publicUpcoming(roundState.upcoming) });
+                }
+                return res.rows[0];
+            });
 
             await logAdminAction("UPDATE_ROUND", { user: userId, roundId, name: v.name });
-            roundState = await loadRoundState();
-            io.to("admins").emit("admin_rounds_changed");
-
-            if (roundState.active && roundState.active.id === roundId) {
-                io.emit("round_updated", { round: publicRound(roundState.active) });
-            } else if (roundState.upcoming && roundState.upcoming.id === roundId) {
-                io.emit("round_updated", { upcoming: publicUpcoming(roundState.upcoming) });
-            }
-
             if (typeof callback === 'function') callback({ success: true, round: publicRound(updated) });
-        } catch (err) { console.error(err); if (typeof callback === 'function') callback({ success: false, error: "Server error" }); }
+        } catch (err) {
+            if (!isMaintenanceError(err)) console.error(err);
+            if (typeof callback === 'function') callback({ success: false, error: isMaintenanceError(err) ? "Идёт восстановление игровых данных, подождите и попробуйте снова." : "Server error" });
+        }
     });
 
     socket.on("start_round", async (payload, callback) => {
@@ -919,15 +1236,20 @@ io.on("connection", async (socket) => {
         const roundId = Number(payload.data && payload.data.id);
         if (!Number.isInteger(roundId)) return callback && callback({ success: false, error: "Invalid round id" });
         try {
-            const started = await withTransaction(pool, (client) => startRoundTx(client, roundId));
+            const started = await withGameOp(async () => {
+                const s = await withTransaction(pool, (client) => startRoundTx(client, roundId));
+                await testPostDbDelay();
+                roundState = await loadRoundState();
+                io.emit("init_data", await buildPublicInitPayload());
+                io.to("admins").emit("admin_rounds_changed");
+                return s;
+            });
             await logAdminAction("START_ROUND", { user: userId, roundId, name: started.name });
-            roundState = await loadRoundState();
-            io.emit("init_data", await buildPublicInitPayload());
-            io.to("admins").emit("admin_rounds_changed");
             if (typeof callback === 'function') callback({ success: true, round: publicRound(started) });
         } catch (err) {
             const message = err.message === "ANOTHER_ROUND_ACTIVE" ? "Другой раунд уже активен"
                 : err.message === "ROUND_NOT_DRAFT" ? "Раунд не является черновиком"
+                : isMaintenanceError(err) ? "Идёт восстановление игровых данных, подождите и попробуйте снова."
                 : "Server error";
             if (typeof callback === 'function') callback({ success: false, error: message });
         }
@@ -943,15 +1265,19 @@ io.on("connection", async (socket) => {
 
         finishingRoundIds.add(roundId);
         try {
-            const finished = await finishAndArchiveRound(roundId);
+            const finished = await withGameOp(async () => {
+                const f = await finishAndArchiveRound(roundId);
+                await testPostDbDelay();
+                roundState = await loadRoundState();
+                io.emit("init_data", await buildPublicInitPayload());
+                io.to("admins").emit("admin_rounds_changed");
+                return f;
+            });
             await logAdminAction("FINISH_ROUND", { user: userId, roundId: finished.id, name: finished.name });
-            roundState = await loadRoundState();
-            io.emit("init_data", await buildPublicInitPayload());
-            io.to("admins").emit("admin_rounds_changed");
             if (typeof callback === 'function') callback({ success: true });
         } catch (err) {
-            console.error(err);
-            if (typeof callback === 'function') callback({ success: false, error: "Раунд не активен или не удалось создать архив" });
+            if (!isMaintenanceError(err)) console.error(err);
+            if (typeof callback === 'function') callback({ success: false, error: isMaintenanceError(err) ? "Идёт восстановление игровых данных, подождите и попробуйте снова." : "Раунд не активен или не удалось создать архив" });
         } finally {
             finishingRoundIds.delete(roundId);
         }
@@ -966,19 +1292,27 @@ io.on("connection", async (socket) => {
             // здесь нужна: черновик никогда не имел пикселей/истории/снимков
             // (они создаются только для активного раунда), поэтому удаление
             // черновика не может задеть данные завершённых раундов.
-            const res = await pool.query(
-                "DELETE FROM rounds WHERE id = $1 AND status = 'draft' RETURNING id, name",
-                [roundId]
-            );
-            if (res.rows.length === 0) {
+            const deleted = await withGameOp(async () => {
+                const res = await pool.query(
+                    "DELETE FROM rounds WHERE id = $1 AND status = 'draft' RETURNING id, name",
+                    [roundId]
+                );
+                if (res.rows.length === 0) return null;
+                await testPostDbDelay();
+                roundState = await loadRoundState();
+                io.to("admins").emit("admin_rounds_changed");
+                io.emit("round_updated", { upcoming: publicUpcoming(roundState.upcoming) });
+                return res.rows[0];
+            });
+            if (!deleted) {
                 return callback && callback({ success: false, error: "Удалить можно только черновик" });
             }
-            await logAdminAction("DELETE_ROUND", { user: userId, roundId, name: res.rows[0].name });
-            roundState = await loadRoundState();
-            io.to("admins").emit("admin_rounds_changed");
-            io.emit("round_updated", { upcoming: publicUpcoming(roundState.upcoming) });
+            await logAdminAction("DELETE_ROUND", { user: userId, roundId, name: deleted.name });
             if (typeof callback === 'function') callback({ success: true });
-        } catch (err) { console.error(err); if (typeof callback === 'function') callback({ success: false, error: "Server error" }); }
+        } catch (err) {
+            if (!isMaintenanceError(err)) console.error(err);
+            if (typeof callback === 'function') callback({ success: false, error: isMaintenanceError(err) ? "Идёт восстановление игровых данных, подождите и попробуйте снова." : "Server error" });
+        }
     });
 
     socket.on("export_database", async (payload, callback) => {
@@ -1004,18 +1338,21 @@ io.on("connection", async (socket) => {
 
         const { pixels } = normalized.value;
         try {
-            await withTransaction(pool, async (client) => {
-                await client.query("DELETE FROM pixels WHERE round_id = $1", [round.id]);
-                await bulkInsertPixels(client, round.id, pixels);
+            await withGameOp(async () => {
+                await withTransaction(pool, async (client) => {
+                    await client.query("DELETE FROM pixels WHERE round_id = $1", [round.id]);
+                    await bulkInsertPixels(client, round.id, pixels);
+                });
+                await testPostDbDelay();
+                roundState = await loadRoundState();
+                io.emit("init_data", await buildPublicInitPayload());
             });
 
             await logAdminAction("IMPORT_DB", { user: userId, roundId: round.id, pixelCount: pixels.length });
-            roundState = await loadRoundState();
-            io.emit("init_data", await buildPublicInitPayload());
             if (typeof callback === "function") callback({ success: true });
         } catch (err) {
-            console.error("Import error:", err);
-            if (typeof callback === "function") callback({ success: false });
+            if (!isMaintenanceError(err)) console.error("Import error:", err);
+            if (typeof callback === "function") callback({ success: false, error: isMaintenanceError(err) ? "Идёт восстановление игровых данных, подождите и попробуйте снова." : undefined });
         }
     });
 
@@ -1030,34 +1367,38 @@ io.on("connection", async (socket) => {
         }
 
         try {
-            const restoredPixels = await withTransaction(pool, async (client) => {
-                const targetTime = new Date(Date.now() - rollback.timeAgoMinutes * 60 * 1000);
-                const res = await client.query(`
-                    SELECT DISTINCT ON (x, y) x, y, color, user_id
-                    FROM pixel_history
-                    WHERE round_id = $1 AND x >= $2 AND x <= $3 AND y >= $4 AND y <= $5 AND created_at <= $6
-                    ORDER BY x, y, created_at DESC
-                `, [round.id, rollback.x1, rollback.x2, rollback.y1, rollback.y2, targetTime]);
+            const restoredPixels = await withGameOp(async () => {
+                const count = await withTransaction(pool, async (client) => {
+                    const targetTime = new Date(Date.now() - rollback.timeAgoMinutes * 60 * 1000);
+                    const res = await client.query(`
+                        SELECT DISTINCT ON (x, y) x, y, color, user_id
+                        FROM pixel_history
+                        WHERE round_id = $1 AND x >= $2 AND x <= $3 AND y >= $4 AND y <= $5 AND created_at <= $6
+                        ORDER BY x, y, created_at DESC
+                    `, [round.id, rollback.x1, rollback.x2, rollback.y1, rollback.y2, targetTime]);
 
-                await client.query(
-                    "DELETE FROM pixels WHERE round_id = $1 AND x >= $2 AND x <= $3 AND y >= $4 AND y <= $5",
-                    [round.id, rollback.x1, rollback.x2, rollback.y1, rollback.y2]
-                );
+                    await client.query(
+                        "DELETE FROM pixels WHERE round_id = $1 AND x >= $2 AND x <= $3 AND y >= $4 AND y <= $5",
+                        [round.id, rollback.x1, rollback.x2, rollback.y1, rollback.y2]
+                    );
 
-                // Восстанавливаем только те цвета, что всё ещё входят в палитру раунда.
-                const restorable = res.rows.filter(p => isColorInPalette(p.color, round.palette));
-                await bulkInsertPixels(client, round.id, restorable);
+                    // Восстанавливаем только те цвета, что всё ещё входят в палитру раунда.
+                    const restorable = res.rows.filter(p => isColorInPalette(p.color, round.palette));
+                    await bulkInsertPixels(client, round.id, restorable);
 
-                return restorable.length;
+                    return restorable.length;
+                });
+                await testPostDbDelay();
+                roundState = await loadRoundState();
+                io.emit("init_data", await buildPublicInitPayload());
+                return count;
             });
 
             await logAdminAction("ROLLBACK_AREA", { user: userId, roundId: round.id, ...rollback });
-            roundState = await loadRoundState();
-            io.emit("init_data", await buildPublicInitPayload());
             if (typeof callback === "function") callback({ success: true, count: restoredPixels });
         } catch (err) {
-            console.error("Rollback error:", err);
-            if (typeof callback === "function") callback({ success: false });
+            if (!isMaintenanceError(err)) console.error("Rollback error:", err);
+            if (typeof callback === "function") callback({ success: false, error: isMaintenanceError(err) ? "Идёт восстановление игровых данных, подождите и попробуйте снова." : undefined });
         }
     });
 });

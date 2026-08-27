@@ -82,6 +82,30 @@ function httpPostForm(url, fields, headers = {}) {
     });
 }
 
+// Универсальный HTTP-запрос с JSON- или сырым телом и произвольными
+// заголовками - используется для тестов бэкапа (экспорт/восстановление
+// поверх обычного HTTP, а не Socket.IO).
+function httpRequest(method, url, { headers = {}, body } = {}) {
+    return new Promise((resolve, reject) => {
+        const data = body === undefined
+            ? undefined
+            : (typeof body === "string" ? body : JSON.stringify(body));
+        const finalHeaders = { ...headers };
+        if (data !== undefined) {
+            finalHeaders["Content-Type"] = finalHeaders["Content-Type"] || "application/json";
+            finalHeaders["Content-Length"] = Buffer.byteLength(data);
+        }
+        const req = http.request(url, { method, headers: finalHeaders }, (res) => {
+            const chunks = [];
+            res.on("data", (c) => chunks.push(c));
+            res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString("utf8") }));
+        });
+        req.on("error", reject);
+        if (data !== undefined) req.write(data);
+        req.end();
+    });
+}
+
 function extractCookie(res, name) {
     const setCookie = res.headers["set-cookie"] || [];
     for (const c of setCookie) {
@@ -161,7 +185,8 @@ async function startTestServer(options = {}) {
         DB_USER, DB_PASSWORD, DB_HOST, DB_PORT: String(DB_PORT), DB_NAME: dbName,
         ADMIN_PASSWORD: "integration-test-admin-password",
         SESSION_SECRET: "integration-test-session-secret-value-0123456789",
-        ROUND_SYNC_INTERVAL_MS: String(options.roundSyncIntervalMs || 300)
+        ROUND_SYNC_INTERVAL_MS: String(options.roundSyncIntervalMs || 300),
+        ...(options.extraEnv || {})
     };
 
     const child = spawn(process.execPath, [path.join(__dirname, "..", "..", "server.js")], { env });
@@ -266,13 +291,16 @@ async function visitorSession(baseUrl) {
 
     const socket = io(baseUrl, { extraHeaders: { Cookie: uidCookie }, transports: ["websocket"] });
     // См. комментарий в adminSession: ждём init_data, а не голый 'connect'.
-    await new Promise((resolve, reject) => {
+    // Сохраняем сам payload - тестам гонки нужно проверить, что состояние,
+    // которое видит только что подключившийся клиент, реально совпадает с
+    // тем, что восстановил backup.
+    const initData = await new Promise((resolve, reject) => {
         socket.once("init_data", resolve);
         socket.once("connect_error", reject);
         setTimeout(() => reject(new Error("visitor socket did not receive init_data in time")), 8000);
     });
 
-    return { socket, close: () => socket.close() };
+    return { socket, cookie: uidCookie, initData, close: () => socket.close() };
 }
 
 module.exports = {
@@ -281,5 +309,6 @@ module.exports = {
     visitorSession,
     waitUntil,
     sleep,
-    httpGet
+    httpGet,
+    httpRequest
 };

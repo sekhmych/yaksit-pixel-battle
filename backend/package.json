@@ -23,6 +23,6 @@
     "start": "node server.js",
     "test": "node --test test/*.test.js",
     "pretest:integration": "node test/integration/ensure-public.js",
-    "test:integration": "node --test test/integration/*.test.js"
+    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.js"
   }
 }

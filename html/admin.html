@@ -311,6 +311,35 @@
         </div>
 
         <div x-show="activeTab === 'system'" x-cloak class="tab-content space-y-6">
+            <!-- Полный бэкап игры -->
+            <div class="bg-gray-800 p-6 rounded-2xl border-2 border-purple-700/50 shadow-xl">
+                <h2 class="text-lg font-bold mb-2 text-purple-400">💾 Полный бэкап игры</h2>
+                <p class="text-xs text-gray-400 mb-4">
+                    Раунды, пиксели, история пикселей, снимки и архивы раундов (с PNG) - без сессий, модераторов, паролей и других данных доступа.
+                    Лимит размера файла (переменная окружения <code>BACKUP_MAX_BYTES</code>) действует одинаково и на скачивание, и на восстановление - слишком большой бэкап сервер не отдаст на скачивание.
+                </p>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <a href="/admin/backup/export"
+                       class="bg-gray-700 hover:bg-gray-600 py-4 rounded-xl text-sm font-bold transition flex items-center justify-center gap-2 text-center">
+                        💾 Скачать бэкап игры
+                    </a>
+                    <button id="btn-choose-backup-file" class="bg-gray-700 hover:bg-gray-600 py-4 rounded-xl text-sm font-bold transition flex items-center justify-center gap-2">
+                        📄 Выбрать файл бэкапа
+                    </button>
+                </div>
+                <input type="file" id="restore-backup-file" class="hidden" accept=".json,application/json">
+                <div id="restore-file-name" class="text-[11px] text-gray-500 mt-2 text-center"></div>
+
+                <div class="mt-4 bg-red-900/20 border border-red-700/40 rounded-lg px-3 py-2 text-[11px] text-red-200">
+                    ⚠️ Восстановление ПОЛНОСТЬЮ заменит текущие раунды, пиксели, историю и архивы содержимым файла. Действие необратимо.
+                </div>
+
+                <button id="btn-restore-backup" disabled
+                        class="mt-4 w-full bg-red-900/30 hover:bg-red-600 border border-red-500/50 text-red-200 hover:text-white py-3 rounded-lg font-bold transition disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-red-900/30">
+                    ♻️ ВОССТАНОВИТЬ ИГРУ ИЗ ФАЙЛА
+                </button>
+            </div>
+
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 <!-- Бэкап -->
                 <div class="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl">
@@ -944,6 +973,69 @@
                 importFile.value = '';
             });
             reader.readAsText(file);
+        });
+
+        // Полный бэкап игры (раунды/пиксели/история/снимки/архивы).
+        // Скачивание - обычная ссылка на admin-only HTTP-эндпоинт (браузер сам
+        // покажет диалог сохранения по Content-Disposition). Восстановление -
+        // отдельный POST с CSRF-токеном в заголовке (не через Socket.IO).
+        const restoreFileInput = document.getElementById('restore-backup-file');
+        const btnChooseBackupFile = document.getElementById('btn-choose-backup-file');
+        const btnRestoreBackup = document.getElementById('btn-restore-backup');
+        const restoreFileNameEl = document.getElementById('restore-file-name');
+        let selectedBackupFile = null;
+
+        btnChooseBackupFile.addEventListener('click', () => restoreFileInput.click());
+        restoreFileInput.addEventListener('change', (e) => {
+            selectedBackupFile = e.target.files[0] || null;
+            restoreFileNameEl.textContent = selectedBackupFile ? `Выбран файл: ${selectedBackupFile.name}` : '';
+            btnRestoreBackup.disabled = !selectedBackupFile;
+        });
+
+        btnRestoreBackup.addEventListener('click', async () => {
+            if (!selectedBackupFile) return;
+            if (!confirm('ВНИМАНИЕ! Текущие раунды, пиксели, история и архивы будут ПОЛНОСТЬЮ заменены содержимым файла. Это действие необратимо. Продолжить?')) {
+                return;
+            }
+            const typed = prompt('Для подтверждения введите слово ВОССТАНОВИТЬ:');
+            if (typed !== 'ВОССТАНОВИТЬ') {
+                alert('Восстановление отменено: подтверждение не совпало.');
+                return;
+            }
+
+            let parsedBackup;
+            try {
+                parsedBackup = JSON.parse(await selectedBackupFile.text());
+            } catch (e) {
+                alert('Не удалось прочитать файл: некорректный JSON.');
+                return;
+            }
+
+            const originalLabel = btnRestoreBackup.textContent;
+            btnRestoreBackup.disabled = true;
+            btnRestoreBackup.textContent = 'Восстановление...';
+            try {
+                const res = await fetch('/admin/backup/restore', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+                    body: JSON.stringify(parsedBackup)
+                });
+                const data = await res.json().catch(() => ({ success: false, error: 'Некорректный ответ сервера' }));
+                if (data.success) {
+                    const s = data.summary || {};
+                    alert(`Восстановление завершено!\nРаунды: ${s.rounds}\nПиксели: ${s.pixels}\nИстория: ${s.pixelHistory}\nСнимки: ${s.snapshots}\nАрхивы: ${s.roundArchives}`);
+                } else {
+                    alert('Ошибка восстановления: ' + (data.error || 'неизвестная ошибка'));
+                }
+            } catch (e) {
+                alert('Ошибка сети при восстановлении.');
+            } finally {
+                selectedBackupFile = null;
+                restoreFileInput.value = '';
+                restoreFileNameEl.textContent = '';
+                btnRestoreBackup.disabled = true;
+                btnRestoreBackup.textContent = originalLabel;
+            }
         });
     </script>
 </body>
