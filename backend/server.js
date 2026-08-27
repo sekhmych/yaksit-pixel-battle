@@ -31,6 +31,11 @@ const {
     autoStartEligibleDraftTx,
     finishRound
 } = require("./lib/rounds");
+const {
+    serializeBackup,
+    validateBackup,
+    restoreBackupTx
+} = require("./lib/backup");
 
 // === ГЛОБАЛЬНЫЕ ОБРАБОТЧИКИ ОШИБОК ===
 process.on('uncaughtException', (err) => {
@@ -51,6 +56,15 @@ const server = http.createServer(app);
 const ROUND_SYNC_INTERVAL_MS = Number(process.env.ROUND_SYNC_INTERVAL_MS) > 0
     ? Number(process.env.ROUND_SYNC_INTERVAL_MS)
     : 15000;
+
+// Максимальный размер JSON-файла полного игрового бэкапа при восстановлении
+// (в байтах). Не входит в обязательную конфигурацию - есть безопасное
+// значение по умолчанию. Ограничивает и HTTP body-parser, и валидацию.
+const BACKUP_MAX_BYTES = Number(process.env.BACKUP_MAX_BYTES) > 0
+    ? Number(process.env.BACKUP_MAX_BYTES)
+    : 50 * 1024 * 1024; // 50 MB
+
+const BACKUP_RESTORE_PATH = "/admin/backup/restore";
 
 // Дефолтная палитра для архивного раунда, создаваемого при миграции
 // старого (до системы раундов) холста, чтобы не потерять его историю.
@@ -94,8 +108,18 @@ app.use(helmet({
 }));
 
 // 3. Базовые парсеры
-app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
+// Эндпоинт восстановления бэкапа сам ставит себе увеличенный лимит на тело
+// запроса (BACKUP_MAX_BYTES) - остальные маршруты остаются под стандартным
+// лимитом body-parser'а, поэтому именно для этого пути глобальные парсеры
+// пропускаются.
+app.use((req, res, next) => {
+    if (req.method === "POST" && req.path === BACKUP_RESTORE_PATH) return next();
+    express.json()(req, res, next);
+});
+app.use((req, res, next) => {
+    if (req.method === "POST" && req.path === BACKUP_RESTORE_PATH) return next();
+    express.urlencoded({ extended: false })(req, res, next);
+});
 app.use(cookieParser(SESSION_SECRET));
 
 // 4. Подключение к БД
@@ -201,12 +225,6 @@ const noCache = (req, res, next) => {
     next();
 };
 
-// Обработчик CSRF ошибок
-app.use((err, req, res, next) => {
-    if (err.code !== 'EBADCSRFTOKEN') return next(err);
-    res.status(403).send('Ошибка безопасности: CSRF-токен невалиден. Пожалуйста, обновите страницу.');
-});
-
 // === СОСТОЯНИЕ РАУНДОВ ===
 //
 // roundState.active   - раунд со статусом 'active' (рисование разрешено), либо null.
@@ -217,6 +235,18 @@ app.use((err, req, res, next) => {
 let roundState = { active: null, view: null, upcoming: null };
 const finishingRoundIds = new Set();
 const onlineUserIds = new Map(); // socket.id -> userId, для подсчёта онлайна
+
+// Глобальный режим обслуживания на время восстановления бэкапа: рисование,
+// автозапуск/автозавершение раундов и изменяющие admin-действия по сокетам
+// не проходят, пока идёт восстановление (см. socket.use ниже и
+// synchronizeRounds). HTTP-эндпоинты бэкапа сами включают/выключают его.
+let maintenanceMode = false;
+const MAINTENANCE_BLOCKED_EVENTS = new Set([
+    "set_pixel", "delete_pixel", "clear_canvas",
+    "create_round", "update_round", "start_round", "finish_round", "delete_round",
+    "export_database", "import_database", "rollback_area", "create_manual_snapshot",
+    "create_moderator", "delete_moderator", "update_moderator_password"
+]);
 
 function publicRound(row) {
     if (!row) return null;
@@ -397,6 +427,7 @@ async function autoStartEligibleDraft() {
 // запускаем самый ранний подходящий черновик. Порядок важен - иначе только
 // что истёкший раунд мог бы на мгновение помешать запуску следующего.
 async function synchronizeRounds() {
+    if (maintenanceMode) return;
     await autoFinishExpiredRound();
     await autoStartEligibleDraft();
 }
@@ -470,6 +501,99 @@ app.get("/admin/download-timelapse", async (req, res) => {
     } catch (err) {
         console.error("Zip error:", err);
         res.status(500).send("Error creating archive");
+    }
+});
+
+function requireAdmin(req, res, next) {
+    if (!req.isAuthenticated() || req.user.role !== 'admin') {
+        return res.status(403).json({ success: false, error: "Access Denied" });
+    }
+    next();
+}
+
+// Полный логический бэкап ИГРОВЫХ данных (раунды/пиксели/история/снимки/
+// архивы) - НЕ pg_dump, НЕ сессии/модераторы/пароли/секреты. Читается из
+// одного согласованного snapshot БД (REPEATABLE READ), чтобы связанные
+// таблицы не оказались от разных моментов времени.
+app.get("/admin/backup/export", requireAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+        const [rounds, pixels, pixelHistory, snapshots, roundArchives] = await Promise.all([
+            client.query("SELECT * FROM rounds ORDER BY id"),
+            client.query("SELECT * FROM pixels ORDER BY round_id, x, y"),
+            client.query("SELECT * FROM pixel_history ORDER BY id"),
+            client.query("SELECT * FROM snapshots ORDER BY id"),
+            client.query("SELECT * FROM round_archives ORDER BY round_id")
+        ]);
+        await client.query("COMMIT");
+
+        const backup = serializeBackup({
+            rounds: rounds.rows,
+            pixels: pixels.rows,
+            pixelHistory: pixelHistory.rows,
+            snapshots: snapshots.rows,
+            roundArchives: roundArchives.rows
+        });
+
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        res.setHeader("Content-Type", "application/json");
+        res.setHeader("Content-Disposition", `attachment; filename="yaksit-pixel-battle-game-backup-${stamp}.json"`);
+        res.send(JSON.stringify(backup));
+        await logAdminAction("EXPORT_GAME_BACKUP", {
+            user: req.user.id,
+            rounds: rounds.rowCount,
+            pixels: pixels.rowCount,
+            pixelHistory: pixelHistory.rowCount,
+            snapshots: snapshots.rowCount,
+            roundArchives: roundArchives.rowCount
+        });
+    } catch (err) {
+        console.error("Backup export error:", err);
+        try { await client.query("ROLLBACK"); } catch (_) { /* no-op */ }
+        res.status(500).json({ success: false, error: "Server error" });
+    } finally {
+        client.release();
+    }
+});
+
+// Восстановление игровых данных из бэкапа. Полностью заменяет rounds/
+// pixels/pixel_history/snapshots/round_archives проверенным содержимым
+// файла; session/moderators/users/settings/admin_logs не затрагиваются.
+app.post(BACKUP_RESTORE_PATH, requireAdmin, csrfProtection, express.json({ limit: BACKUP_MAX_BYTES }), async (req, res) => {
+    const contentLength = Number(req.headers["content-length"]);
+    const validated = validateBackup(req.body, {
+        maxBytes: BACKUP_MAX_BYTES,
+        rawByteLength: Number.isFinite(contentLength) && contentLength > 0 ? contentLength : undefined
+    });
+    if (!validated.ok) {
+        return res.status(400).json({ success: false, error: validated.error });
+    }
+
+    if (maintenanceMode) {
+        return res.status(409).json({ success: false, error: "Восстановление уже выполняется." });
+    }
+
+    maintenanceMode = true;
+    try {
+        const summary = await withTransaction(pool, (client) => restoreBackupTx(client, validated.value));
+
+        roundState = await loadRoundState();
+        io.emit("init_data", await buildPublicInitPayload());
+        io.to("admins").emit("admin_rounds_changed");
+
+        await logAdminAction("RESTORE_GAME_BACKUP", {
+            user: req.user.id,
+            exportedAt: validated.value.exportedAt,
+            ...summary
+        });
+
+        res.json({ success: true, summary });
+    } catch (err) {
+        console.error("Backup restore error:", err);
+        res.status(500).json({ success: false, error: "Не удалось восстановить бэкап - изменения отменены." });
+    } finally {
+        maintenanceMode = false;
     }
 });
 
@@ -578,6 +702,25 @@ app.get("/api/rounds/archive/:id/preview.png", async (req, res) => {
 
 app.use(express.static(path.join(__dirname, "public"), { index: false }));
 
+// Обработчик CSRF- и body-parser-ошибок. Должен идти ПОСЛЕ всех маршрутов:
+// Express ищет error-handling middleware, продолжая обход стека вперёд от
+// точки, где случилась ошибка, а не с начала - если зарегистрировать этот
+// обработчик раньше самих маршрутов, он никогда не будет достигнут и клиент
+// получит дефолтную страницу ошибки Express со стектрейсом.
+app.use((err, req, res, next) => {
+    if (err.code === 'EBADCSRFTOKEN') {
+        return res.status(403).send('Ошибка безопасности: CSRF-токен невалиден. Пожалуйста, обновите страницу.');
+    }
+    if (err.type === 'entity.too.large' || err.status === 413) {
+        return res.status(413).json({ success: false, error: 'Файл превышает допустимый размер.' });
+    }
+    if (err.type === 'entity.parse.failed') {
+        return res.status(400).json({ success: false, error: 'Невалидный JSON.' });
+    }
+    console.error("Unhandled request error:", err);
+    return res.status(500).json({ success: false, error: 'Внутренняя ошибка сервера.' });
+});
+
 // === SOCKET.IO ===
 
 const io = new Server(server, {
@@ -617,6 +760,11 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 io.on("connection", async (socket) => {
     socket.use(([event, ...args], next) => {
+        if (maintenanceMode && MAINTENANCE_BLOCKED_EVENTS.has(event)) {
+            const ack = args[args.length - 1];
+            if (typeof ack === "function") ack({ success: false, error: "Идёт восстановление игровых данных, подождите и попробуйте снова." });
+            return;
+        }
         if (socket.isAdmin) return next();
         const now = Date.now();
         const rate = messageRates.get(socket.id) || { count: 0, startTime: now };

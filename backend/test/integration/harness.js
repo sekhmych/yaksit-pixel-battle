@@ -82,6 +82,30 @@ function httpPostForm(url, fields, headers = {}) {
     });
 }
 
+// Универсальный HTTP-запрос с JSON- или сырым телом и произвольными
+// заголовками - используется для тестов бэкапа (экспорт/восстановление
+// поверх обычного HTTP, а не Socket.IO).
+function httpRequest(method, url, { headers = {}, body } = {}) {
+    return new Promise((resolve, reject) => {
+        const data = body === undefined
+            ? undefined
+            : (typeof body === "string" ? body : JSON.stringify(body));
+        const finalHeaders = { ...headers };
+        if (data !== undefined) {
+            finalHeaders["Content-Type"] = finalHeaders["Content-Type"] || "application/json";
+            finalHeaders["Content-Length"] = Buffer.byteLength(data);
+        }
+        const req = http.request(url, { method, headers: finalHeaders }, (res) => {
+            const chunks = [];
+            res.on("data", (c) => chunks.push(c));
+            res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString("utf8") }));
+        });
+        req.on("error", reject);
+        if (data !== undefined) req.write(data);
+        req.end();
+    });
+}
+
 function extractCookie(res, name) {
     const setCookie = res.headers["set-cookie"] || [];
     for (const c of setCookie) {
@@ -272,7 +296,7 @@ async function visitorSession(baseUrl) {
         setTimeout(() => reject(new Error("visitor socket did not receive init_data in time")), 8000);
     });
 
-    return { socket, close: () => socket.close() };
+    return { socket, cookie: uidCookie, close: () => socket.close() };
 }
 
 module.exports = {
@@ -281,5 +305,6 @@ module.exports = {
     visitorSession,
     waitUntil,
     sleep,
-    httpGet
+    httpGet,
+    httpRequest
 };
