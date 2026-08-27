@@ -207,6 +207,7 @@ app.use((err, req, res, next) => {
 // roundState.upcoming - ближайший черновик с датой начала в будущем (для статуса
 //                        "скоро начнётся"), актуален только когда нет активного раунда.
 let roundState = { active: null, view: null, upcoming: null };
+const finishingRoundIds = new Set();
 const onlineUserIds = new Map(); // socket.id -> userId, для подсчёта онлайна
 
 function publicRound(row) {
@@ -297,6 +298,22 @@ async function renderCanvasPreview(queryable, round) {
     return image.getBufferAsync(Jimp.MIME_PNG);
 }
 
+// Блокирует активный раунд, собирает его финальный PNG и только затем
+// переводит его в finished. Это делает превью и число пикселей согласованными.
+async function finishAndArchiveRound(roundId) {
+    return withTransaction(pool, (client) => finishRound(client, {
+        roundId,
+        buildArchive: async (lockedRound, queryable) => {
+            const countRes = await queryable.query(
+                "SELECT COUNT(*)::int AS c FROM pixels WHERE round_id = $1",
+                [lockedRound.id]
+            );
+            const preview = await renderCanvasPreview(queryable, lockedRound);
+            return { preview, pixelCount: countRes.rows[0].c };
+        }
+    }));
+}
+
 // Массовая вставка пикселей одним/несколькими запросами (используется
 // импортом БД и восстановлением области при откате).
 async function bulkInsertPixels(client, roundId, pixels) {
@@ -326,21 +343,21 @@ async function takeSnapshot() {
 
 async function autoFinishExpiredRound() {
     const round = roundState.active;
-    if (!round || new Date(round.ends_at).getTime() > Date.now()) return;
+    if (!round || new Date(round.ends_at).getTime() > Date.now() || finishingRoundIds.has(round.id)) return;
+
+    finishingRoundIds.add(round.id);
     try {
-        const countRes = await pool.query("SELECT COUNT(*)::int AS c FROM pixels WHERE round_id = $1", [round.id]);
-        const preview = await renderCanvasPreview(pool, round);
-        await withTransaction(pool, (client) => finishRound(client, {
-            roundId: round.id,
-            preview,
-            pixelCount: countRes.rows[0].c
-        }));
-        await logAdminAction("AUTO_FINISH_ROUND", { roundId: round.id, name: round.name });
+        const finished = await finishAndArchiveRound(round.id);
+        await logAdminAction("AUTO_FINISH_ROUND", { roundId: finished.id, name: finished.name });
         roundState = await loadRoundState();
         io.emit("init_data", await buildPublicInitPayload());
         io.to("admins").emit("admin_rounds_changed");
-        console.log(`[Rounds] Раунд #${round.id} автоматически завершён по истечении времени`);
-    } catch (err) { console.error("Auto-finish error:", err); }
+        console.log("[Rounds] Раунд #" + finished.id + " автоматически завершён по истечении времени");
+    } catch (err) {
+        console.error("Auto-finish error:", err);
+    } finally {
+        finishingRoundIds.delete(round.id);
+    }
 }
 
 setInterval(takeSnapshot, 10 * 60 * 1000); // Снимок каждые 10 минут
@@ -551,6 +568,7 @@ io.use((socket, next) => {
 });
 
 const userCooldowns = new Map();
+const userPlacementsInFlight = new Set();
 const messageRates = new Map();
 const MSG_LIMIT = 100;
 const MSG_WINDOW_MS = 1000;
@@ -598,10 +616,12 @@ io.on("connection", async (socket) => {
     } catch (err) { console.error(err); }
 
     socket.on("set_pixel", async (data) => {
+        let placementLocked = false;
         try {
             if (!data) return;
             const { x, y, color } = data;
             const round = roundState.active;
+            if (round && finishingRoundIds.has(round.id)) return;
 
             const allowed = assertPixelAllowed({ activeRound: round, x, y, color });
             if (!allowed.ok) return;
@@ -609,19 +629,47 @@ io.on("connection", async (socket) => {
             const now = Date.now();
             const lastPlaced = userCooldowns.get(userId) || 0;
             const cooldownMs = round.cooldown * 1000;
-            if (!socket.canEditCanvas && now - lastPlaced < cooldownMs - 100) return;
+            if (!socket.canEditCanvas && (userPlacementsInFlight.has(userId) || now - lastPlaced < cooldownMs - 100)) return;
+
+            // Не даём двум сообщениям одного пользователя одновременно обойти кулдаун.
+            if (!socket.canEditCanvas) {
+                userPlacementsInFlight.add(userId);
+                placementLocked = true;
+            }
+
+            const placed = await withTransaction(pool, async (client) => {
+                if (finishingRoundIds.has(round.id)) return false;
+
+                // finishRound берёт FOR UPDATE на ту же строку. Значит финальный
+                // снимок ждёт все начатые размещения, а после завершения новые
+                // транзакции уже не увидят active-раунд.
+                const activeCheck = await client.query(
+                    "SELECT id FROM rounds WHERE id = $1 AND status = 'active' FOR SHARE",
+                    [round.id]
+                );
+                if (activeCheck.rows.length === 0) return false;
+
+                await client.query(
+                    "INSERT INTO pixels (round_id, x, y, color, user_id) VALUES ($1, $2, $3, $4, $5) " +
+                    "ON CONFLICT (round_id, x, y) DO UPDATE SET color = EXCLUDED.color, user_id = EXCLUDED.user_id, updated_at = CURRENT_TIMESTAMP",
+                    [round.id, x, y, color, userId]
+                );
+                await client.query(
+                    "INSERT INTO pixel_history (round_id, x, y, color, user_id) VALUES ($1, $2, $3, $4, $5)",
+                    [round.id, x, y, color, userId]
+                );
+                return true;
+            });
+            if (!placed) return;
+
             if (!socket.canEditCanvas) {
                 userCooldowns.set(userId, now);
-                await pool.query("INSERT INTO users (user_id, last_placed_at) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET last_placed_at = EXCLUDED.last_placed_at", [userId, now]);
+                await pool.query(
+                    "INSERT INTO users (user_id, last_placed_at) VALUES ($1, $2) " +
+                    "ON CONFLICT (user_id) DO UPDATE SET last_placed_at = EXCLUDED.last_placed_at",
+                    [userId, now]
+                );
             }
-            await pool.query(
-                `INSERT INTO pixels (round_id, x, y, color, user_id) VALUES ($1, $2, $3, $4, $5)
-                 ON CONFLICT (round_id, x, y) DO UPDATE SET color = EXCLUDED.color, user_id = EXCLUDED.user_id, updated_at = CURRENT_TIMESTAMP`,
-                [round.id, x, y, color, userId]
-            );
-
-            // Запись в историю для откатов
-            await pool.query(`INSERT INTO pixel_history (round_id, x, y, color, user_id) VALUES ($1, $2, $3, $4, $5)`, [round.id, x, y, color, userId]);
 
             round.pixelsPlaced = (round.pixelsPlaced || 0) + 1;
             if (roundState.view && roundState.view.id === round.id) roundState.view.pixelsPlaced = round.pixelsPlaced;
@@ -631,7 +679,11 @@ io.on("connection", async (socket) => {
             if (socket.canEditCanvas) {
                 await logAdminAction("SET_PIXEL", { user: userId, x, y, color, role: socket.isAdmin ? 'admin' : 'moderator' });
             }
-        } catch (err) { console.error(err); }
+        } catch (err) {
+            console.error(err);
+        } finally {
+            if (placementLocked) userPlacementsInFlight.delete(userId);
+        }
     });
 
     socket.on("delete_pixel", async (payload) => {
@@ -833,26 +885,24 @@ io.on("connection", async (socket) => {
         if (!socket.isAdmin || !verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
         const roundId = Number(payload.data && payload.data.id);
         if (!Number.isInteger(roundId)) return callback && callback({ success: false, error: "Invalid round id" });
+        if (finishingRoundIds.has(roundId)) {
+            return callback && callback({ success: false, error: "Раунд уже завершается" });
+        }
+
+        finishingRoundIds.add(roundId);
         try {
-            const roundRes = await pool.query("SELECT * FROM rounds WHERE id = $1 AND status = 'active'", [roundId]);
-            if (roundRes.rows.length === 0) return callback && callback({ success: false, error: "Раунд не активен" });
-            const round = roundRes.rows[0];
-
-            const countRes = await pool.query("SELECT COUNT(*)::int AS c FROM pixels WHERE round_id = $1", [round.id]);
-            const preview = await renderCanvasPreview(pool, round);
-
-            await withTransaction(pool, (client) => finishRound(client, {
-                roundId: round.id,
-                preview,
-                pixelCount: countRes.rows[0].c
-            }));
-
-            await logAdminAction("FINISH_ROUND", { user: userId, roundId: round.id, name: round.name });
+            const finished = await finishAndArchiveRound(roundId);
+            await logAdminAction("FINISH_ROUND", { user: userId, roundId: finished.id, name: finished.name });
             roundState = await loadRoundState();
             io.emit("init_data", await buildPublicInitPayload());
             io.to("admins").emit("admin_rounds_changed");
             if (typeof callback === 'function') callback({ success: true });
-        } catch (err) { console.error(err); if (typeof callback === 'function') callback({ success: false, error: "Server error" }); }
+        } catch (err) {
+            console.error(err);
+            if (typeof callback === 'function') callback({ success: false, error: "Раунд не активен или не удалось создать архив" });
+        } finally {
+            finishingRoundIds.delete(roundId);
+        }
     });
 
     socket.on("export_database", async (payload, callback) => {
