@@ -620,6 +620,7 @@
             if (data.round) {
                 activeRound = data.round.status === 'active' ? data.round : null;
                 applyRoundToCanvas(data.round);
+                buildPalette();
             }
         });
 
