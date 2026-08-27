@@ -104,11 +104,16 @@
                                 &middot; кулдаун <span x-text="r.cooldown"></span>с
                                 &middot; <span x-text="(r.palette || []).length"></span> цветов
                             </div>
+                            <div x-show="isExpiredDraft(r)" class="text-[11px] text-orange-400 font-bold mt-1">
+                                ⚠️ Время истекло - измените даты или удалите
+                            </div>
                         </div>
-                        <div class="flex gap-2 shrink-0">
+                        <div class="flex gap-2 shrink-0 flex-wrap">
                             <button x-show="r.status !== 'finished'" @click="openEditor(r)" class="px-3 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-xs font-bold">Изменить</button>
-                            <button x-show="r.status === 'draft'" @click="confirmStart(r)" class="px-3 py-2 bg-green-700 hover:bg-green-600 rounded-lg text-xs font-bold">Запустить</button>
+                            <button x-show="r.status === 'draft' && !isExpiredDraft(r)" @click="confirmStart(r)" class="px-3 py-2 bg-green-700 hover:bg-green-600 rounded-lg text-xs font-bold">Запустить</button>
                             <button x-show="r.status === 'active'" @click="confirmFinish(r)" class="px-3 py-2 bg-red-700 hover:bg-red-600 rounded-lg text-xs font-bold">Завершить</button>
+                            <button @click="duplicateRound(r)" class="px-3 py-2 bg-blue-900/40 hover:bg-blue-700 border border-blue-700/50 rounded-lg text-xs font-bold">Дублировать</button>
+                            <button x-show="r.status === 'draft'" @click="confirmDelete(r)" class="px-3 py-2 bg-red-900/30 hover:bg-red-600 border border-red-700/50 rounded-lg text-xs font-bold">Удалить</button>
                             <a x-show="r.status === 'finished'" :href="'/archive/' + r.id" target="_blank" class="px-3 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-xs font-bold">В архиве</a>
                         </div>
                     </div>
@@ -397,6 +402,9 @@
                     if (!dateStr) return '-';
                     return new Date(dateStr).toLocaleString();
                 },
+                isExpiredDraft(round) {
+                    return round.status === 'draft' && new Date(round.ends_at).getTime() <= Date.now();
+                },
 
                 loadModerators() {
                     emitWithAuth('list_moderators', {}, (res) => { if (res.success) this.moderators = res.moderators; });
@@ -450,6 +458,44 @@
                         this.form.ends_at = toLocalInput(end.toISOString());
                     }
                     this.editorOpen = true;
+                },
+
+                // Дублирование не пишет ничего в БД сразу - только открывает
+                // редактор нового черновика, предзаполненного настройками
+                // исходного раунда. Сохраняет админ уже сам, нажав "Сохранить".
+                duplicateRound(round) {
+                    this.formError = '';
+                    this.newPaletteColorText = '';
+                    const durationMs = Math.max(
+                        new Date(round.ends_at).getTime() - new Date(round.starts_at).getTime(),
+                        60 * 1000
+                    );
+                    // Начало через 5 минут от текущего момента, чтобы копию
+                    // нельзя было случайно сохранить уже просроченной.
+                    const starts = new Date(Date.now() + 5 * 60 * 1000);
+                    const ends = new Date(starts.getTime() + durationMs);
+                    this.form = {
+                        id: null,
+                        isDraft: true,
+                        name: `Копия — ${round.name}`,
+                        description: round.description || '',
+                        starts_at: toLocalInput(starts.toISOString()),
+                        ends_at: toLocalInput(ends.toISOString()),
+                        canvas_size: round.canvas_size,
+                        cooldown: round.cooldown,
+                        bg_color: round.bg_color,
+                        grid_enabled: round.grid_enabled,
+                        palette: [...(round.palette || [])]
+                    };
+                    this.editorOpen = true;
+                },
+
+                confirmDelete(round) {
+                    if (!confirm(`Удалить черновик «${round.name}»? Это действие необратимо.`)) return;
+                    emitWithAuth('delete_round', { id: round.id }, (res) => {
+                        if (res.success) this.loadRounds();
+                        else alert(res.error || 'Не удалось удалить раунд');
+                    });
                 },
 
                 addPaletteColor() {
@@ -657,6 +703,8 @@
             if (entry.action === 'START_ROUND') detailsStr = `запустил раунд «${entry.details.name}»`;
             if (entry.action === 'FINISH_ROUND') detailsStr = `завершил раунд «${entry.details.name}»`;
             if (entry.action === 'AUTO_FINISH_ROUND') detailsStr = `раунд «${entry.details.name}» завершён автоматически`;
+            if (entry.action === 'AUTO_START_ROUND') detailsStr = `раунд «${entry.details.name}» запущен автоматически по расписанию`;
+            if (entry.action === 'DELETE_ROUND') detailsStr = `удалил черновик «${entry.details.name}»`;
             if (entry.action === 'CLEAR_CANVAS') detailsStr = '💥 ОЧИСТИЛ ХОЛСТ';
             if (entry.action === 'EXPORT_DB') detailsStr = 'экспортировал БД раунда';
             if (entry.action === 'IMPORT_DB') detailsStr = `импортировал БД (${entry.details.pixelCount} px)`;

@@ -28,6 +28,7 @@ const {
     assertPixelAllowed,
     normalizeRoundPixelImport,
     startRoundTx,
+    autoStartEligibleDraftTx,
     finishRound
 } = require("./lib/rounds");
 
@@ -43,6 +44,13 @@ process.on('unhandledRejection', (reason, promise) => {
 const config = loadConfig(process.env);
 const app = express();
 const server = http.createServer(app);
+
+// Как часто проверять расписание раундов (автозавершение истёкшего активного
+// и автозапуск подходящего черновика). Не входит в обязательную конфигурацию -
+// используется только для ускорения интеграционных тестов.
+const ROUND_SYNC_INTERVAL_MS = Number(process.env.ROUND_SYNC_INTERVAL_MS) > 0
+    ? Number(process.env.ROUND_SYNC_INTERVAL_MS)
+    : 15000;
 
 // Дефолтная палитра для архивного раунда, создаваемого при миграции
 // старого (до системы раундов) холста, чтобы не потерять его историю.
@@ -249,8 +257,11 @@ async function loadRoundState() {
 
     let upcoming = null;
     if (!active) {
+        // "Скоро начнётся" имеет смысл только для черновика, чьё начало ещё
+        // впереди - просроченный черновик (starts_at в прошлом) не в счёт,
+        // иначе он навсегда завис бы в статусе "скоро начнётся".
         const upcomingRes = await pool.query(
-            "SELECT id, name, description, starts_at FROM rounds WHERE status = 'draft' ORDER BY starts_at ASC LIMIT 1"
+            "SELECT id, name, description, starts_at FROM rounds WHERE status = 'draft' AND starts_at > NOW() ORDER BY starts_at ASC LIMIT 1"
         );
         upcoming = upcomingRes.rows[0] || null;
     }
@@ -343,7 +354,7 @@ async function takeSnapshot() {
 
 async function autoFinishExpiredRound() {
     const round = roundState.active;
-    if (!round || new Date(round.ends_at).getTime() > Date.now() || finishingRoundIds.has(round.id)) return;
+    if (!round || new Date(round.ends_at).getTime() > Date.now() || finishingRoundIds.has(round.id)) return false;
 
     finishingRoundIds.add(round.id);
     try {
@@ -353,15 +364,45 @@ async function autoFinishExpiredRound() {
         io.emit("init_data", await buildPublicInitPayload());
         io.to("admins").emit("admin_rounds_changed");
         console.log("[Rounds] Раунд #" + finished.id + " автоматически завершён по истечении времени");
+        return true;
     } catch (err) {
         console.error("Auto-finish error:", err);
+        return false;
     } finally {
         finishingRoundIds.delete(round.id);
     }
 }
 
+async function autoStartEligibleDraft() {
+    // roundState могло только что обновиться внутри autoFinishExpiredRound -
+    // перечитываем актуальное значение, а не полагаемся на устаревший кэш.
+    if (roundState.active) return false;
+    try {
+        const started = await withTransaction(pool, (client) => autoStartEligibleDraftTx(client));
+        if (!started) return false;
+        await logAdminAction("AUTO_START_ROUND", { roundId: started.id, name: started.name });
+        roundState = await loadRoundState();
+        io.emit("init_data", await buildPublicInitPayload());
+        io.to("admins").emit("admin_rounds_changed");
+        console.log("[Rounds] Раунд #" + started.id + " автоматически запущен по расписанию");
+        return true;
+    } catch (err) {
+        console.error("Auto-start error:", err);
+        return false;
+    }
+}
+
+// Единая процедура синхронизации расписания раундов: сначала завершаем
+// истёкший активный раунд (если есть), затем, если активного раунда нет,
+// запускаем самый ранний подходящий черновик. Порядок важен - иначе только
+// что истёкший раунд мог бы на мгновение помешать запуску следующего.
+async function synchronizeRounds() {
+    await autoFinishExpiredRound();
+    await autoStartEligibleDraft();
+}
+
 setInterval(takeSnapshot, 10 * 60 * 1000); // Снимок каждые 10 минут
-setInterval(autoFinishExpiredRound, 15 * 1000); // Проверка окончания активного раунда
+setInterval(synchronizeRounds, ROUND_SYNC_INTERVAL_MS); // Автозавершение + автозапуск по расписанию
 setInterval(async () => {
     try {
         await pool.query("DELETE FROM pixel_history WHERE created_at < NOW() - INTERVAL '48 hours'");
@@ -914,6 +955,30 @@ io.on("connection", async (socket) => {
         } finally {
             finishingRoundIds.delete(roundId);
         }
+    });
+
+    socket.on("delete_round", async (payload, callback) => {
+        if (!socket.isAdmin || !verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
+        const roundId = Number(payload.data && payload.data.id);
+        if (!Number.isInteger(roundId)) return callback && callback({ success: false, error: "Invalid round id" });
+        try {
+            // Условие "status = 'draft'" в WHERE - единственная защита, которая
+            // здесь нужна: черновик никогда не имел пикселей/истории/снимков
+            // (они создаются только для активного раунда), поэтому удаление
+            // черновика не может задеть данные завершённых раундов.
+            const res = await pool.query(
+                "DELETE FROM rounds WHERE id = $1 AND status = 'draft' RETURNING id, name",
+                [roundId]
+            );
+            if (res.rows.length === 0) {
+                return callback && callback({ success: false, error: "Удалить можно только черновик" });
+            }
+            await logAdminAction("DELETE_ROUND", { user: userId, roundId, name: res.rows[0].name });
+            roundState = await loadRoundState();
+            io.to("admins").emit("admin_rounds_changed");
+            io.emit("round_updated", { upcoming: publicUpcoming(roundState.upcoming) });
+            if (typeof callback === 'function') callback({ success: true });
+        } catch (err) { console.error(err); if (typeof callback === 'function') callback({ success: false, error: "Server error" }); }
     });
 
     socket.on("export_database", async (payload, callback) => {

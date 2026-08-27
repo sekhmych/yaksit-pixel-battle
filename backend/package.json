@@ -16,8 +16,13 @@
     "pg": "^8.20.0",
     "socket.io": "^4.8.3"
   },
+  "devDependencies": {
+    "socket.io-client": "^4.8.3"
+  },
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "pretest:integration": "node test/integration/ensure-public.js",
+    "test:integration": "node --test test/integration/*.test.js"
   }
 }
