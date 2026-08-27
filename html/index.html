@@ -109,40 +109,126 @@
         .safe-pb {
             padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
         }
+
+        .safe-pl {
+            padding-left: max(0.5rem, env(safe-area-inset-left));
+        }
+
+        .safe-pr {
+            padding-right: max(0.5rem, env(safe-area-inset-right));
+        }
+
+        /* Индикатор кулдауна: заметная полоса-таймер */
+        #cooldown-bar-track {
+            width: 100%;
+            height: 4px;
+            background: rgba(255, 255, 255, 0.12);
+            border-radius: 999px;
+            overflow: hidden;
+        }
+
+        #cooldown-bar-fill {
+            height: 100%;
+            width: 100%;
+            background: linear-gradient(90deg, #f87171, #fbbf24);
+            transition: width 0.1s linear;
+        }
+
+        .status-pill {
+            font-size: 10px;
+            letter-spacing: 0.05em;
+            font-weight: 800;
+            text-transform: uppercase;
+            padding: 2px 8px;
+            border-radius: 999px;
+            white-space: nowrap;
+        }
+
+        .status-active {
+            background: rgba(34, 197, 94, 0.2);
+            color: #4ade80;
+            border: 1px solid rgba(74, 222, 128, 0.4);
+        }
+
+        .status-upcoming {
+            background: rgba(250, 204, 21, 0.15);
+            color: #facc15;
+            border: 1px solid rgba(250, 204, 21, 0.4);
+        }
+
+        .status-finished {
+            background: rgba(148, 163, 184, 0.15);
+            color: #94a3b8;
+            border: 1px solid rgba(148, 163, 184, 0.35);
+        }
+
+        .status-none {
+            background: rgba(148, 163, 184, 0.1);
+            color: #64748b;
+            border: 1px solid rgba(100, 116, 139, 0.3);
+        }
     </style>
 </head>
 
 <body class="text-white" x-data="{ showInfo: false }">
 
     <div
-        class="fixed top-0 left-0 w-full bg-gray-900/90 backdrop-blur border-b border-gray-700 px-3 safe-pt pb-3 flex justify-between items-center z-20 shadow-lg">
-        <div class="font-bold text-lg sm:text-xl flex items-center gap-2">
-            <div><span class="text-blue-400">Подслушано ЯКСИТ</span> x Pixel Battle by Hamaanda</div>
-            <div id="connection-status"
-                class="w-3 h-3 rounded-full bg-red-500 animate-pulse shadow-[0_0_8px_rgba(239,68,68,0.8)]"
-                title="Подключение к серверу..."></div>
+        class="fixed top-0 left-0 w-full bg-gray-900/90 backdrop-blur border-b border-gray-700 safe-pl safe-pr safe-pt z-20 shadow-lg">
+        <div class="px-1 pb-2 flex justify-between items-center">
+            <div class="font-bold text-base sm:text-xl flex items-center gap-2 min-w-0">
+                <div class="truncate"><span class="text-blue-400">Подслушано ЯКСИТ</span> <span
+                        class="hidden sm:inline">x Pixel Battle by Hamaanda</span></div>
+                <div id="connection-status"
+                    class="w-3 h-3 shrink-0 rounded-full bg-red-500 animate-pulse shadow-[0_0_8px_rgba(239,68,68,0.8)]"
+                    title="Подключение к серверу..."></div>
+            </div>
+            <div class="flex items-center gap-1.5 sm:gap-4 text-xs sm:text-sm shrink-0">
+                <button @click="showInfo = true"
+                    class="p-2 bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors group" title="О проекте">
+                    <svg xmlns="http://www.w3.org/2000/svg"
+                        class="h-4 w-4 sm:h-5 sm:w-5 text-gray-400 group-hover:text-white" fill="none"
+                        viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                </button>
+                <div class="text-gray-400 hidden sm:flex items-center gap-1">
+                    <span>Ваш ID:</span>
+                    <span id="user-info"
+                        class="text-white font-mono bg-gray-800 px-2 py-1 rounded truncate max-w-[120px]">...</span>
+                </div>
+                <div id="cooldown-box"
+                    class="hidden flex-col gap-1 bg-gray-800 border border-gray-700 px-2 sm:px-3 py-1 rounded shadow-inner min-w-[64px]">
+                    <div class="flex items-center gap-1 sm:gap-2">
+                        <span class="text-gray-400 hidden sm:inline text-xs">Ожидание:</span>
+                        <span class="text-gray-400 sm:hidden">⏳</span>
+                        <span id="cooldown-timer" class="font-bold text-red-400 text-xs sm:text-sm">0s</span>
+                    </div>
+                    <div id="cooldown-bar-track">
+                        <div id="cooldown-bar-fill"></div>
+                    </div>
+                </div>
+            </div>
         </div>
-        <div class="flex items-center gap-2 sm:gap-4 text-xs sm:text-sm">
-            <button @click="showInfo = true"
-                class="p-2 bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors group" title="О проекте">
-                <svg xmlns="http://www.w3.org/2000/svg"
-                    class="h-4 w-4 sm:h-5 sm:w-5 text-gray-400 group-hover:text-white" fill="none" viewBox="0 0 24 24"
-                    stroke="currentColor">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                        d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                </svg>
-            </button>
-            <div class="text-gray-400 flex items-center gap-1">
-                <span class="hidden sm:inline">Ваш ID:</span>
-                <span id="user-info"
-                    class="text-white font-mono bg-gray-800 px-2 py-1 rounded truncate max-w-[80px] sm:max-w-[120px]">...</span>
-            </div>
-            <div id="cooldown-box"
-                class="hidden items-center gap-1 sm:gap-2 bg-gray-800 border border-gray-700 px-2 sm:px-3 py-1 rounded shadow-inner">
-                <span class="text-gray-400 hidden sm:inline">Ожидание:</span>
-                <span class="text-gray-400 sm:hidden">⏳</span>
-                <span id="cooldown-timer" class="font-bold text-red-400">0s</span>
-            </div>
+
+        <!-- Полоса статуса раунда -->
+        <div id="round-bar" class="flex flex-wrap items-center gap-x-3 gap-y-1 px-1 pb-2 text-[11px] sm:text-xs">
+            <span id="round-status-badge" class="status-pill status-none">Загрузка…</span>
+            <span id="round-name" class="font-semibold text-gray-200 truncate max-w-[45vw]"></span>
+            <span id="round-countdown" class="font-mono text-gray-300"></span>
+            <span class="ml-auto flex items-center gap-3 text-gray-400 font-mono">
+                <span class="flex items-center gap-1" title="Пользователей онлайн">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" viewBox="0 0 20 20"
+                        fill="currentColor">
+                        <path
+                            d="M9 6a3 3 0 11-6 0 3 3 0 016 0zM17 6a3 3 0 11-6 0 3 3 0 016 0zM12.93 17c.046-.327.07-.66.07-1a6.97 6.97 0 00-1.5-4.33A5 5 0 0119 16v1h-6.07zM6 11a5 5 0 015 5v1H1v-1a5 5 0 015-5z" />
+                    </svg>
+                    <span id="online-count">0</span>
+                </span>
+                <span class="flex items-center gap-1" title="Пикселей поставлено в этом раунде">
+                    🎨<span id="round-pixel-count">0</span>
+                </span>
+            </span>
         </div>
     </div>
 
@@ -168,10 +254,14 @@
 
             <!-- Modal Content -->
             <div class="p-4 sm:p-6 overflow-y-auto text-gray-300 space-y-4 custom-scrollbar">
-                <p class="text-lg font-medium text-white">Добро пожаловать в [Подслушано ЯКСИТ x Pixel Battle by Hamaanda] !</p>
+                <p class="text-lg font-medium text-white">Добро пожаловать в [Подслушано ЯКСИТ x Pixel Battle by
+                    Hamaanda] !</p>
                 <div class="space-y-2">
-                    <p>С 18 по 22 Мая будет проведён ПЕРВЫЙ ПИКСЕЛЬ БАТТЛ ЯКСИТ !!!</p>
-                    <p>Совместно с Подслушано ЯКСИТ 3.0 мы решили организовать его с целью... суеты</p>
+                    <p>Холст живёт раундами: у каждого раунда своё время, своя палитра цветов и общий счёт онлайна.
+                    </p>
+                    <p>Когда раунд активен - можно ставить пиксели. Когда раунд завершается, его итог сохраняется в
+                        <a href="/archive" class="underline text-blue-300">архиве</a> навсегда.
+                    </p>
                 </div>
                 <div class="bg-red-900/50 p-4 rounded-xl border border-gray-700 mt-4">
                     <h3 class="text-sm font-bold text-white uppercase mb-2">Правила</h3>
@@ -183,9 +273,10 @@
                 <div class="bg-gray-900/50 p-4 rounded-xl border border-gray-700 mt-4">
                     <h3 class="text-sm font-bold text-gray-400 uppercase mb-2">Статистика</h3>
                     <ul class="text-sm space-y-1">
-                        <li>• Версия: 0.0.1</li>
+                        <li>• Версия: 0.2 (Раунды и живой холст)</li>
                         <li>• Разработчик: resotuqu (hamaanda member)</li>
-                        <li>• Для связи: <a class="underline" target="_blank" href="https://t.me/resotuqu">resotuqu</a></li>
+                        <li>• Для связи: <a class="underline" target="_blank"
+                                href="https://t.me/resotuqu">resotuqu</a></li>
                     </ul>
                 </div>
             </div>
@@ -211,42 +302,49 @@
             style="border-width: 2px;"></div>
     </div>
 
+    <!-- Баннер: рисование недоступно -->
+    <div id="draw-disabled-banner"
+        class="hidden fixed bottom-24 sm:bottom-28 left-1/2 -translate-x-1/2 bg-yellow-900/90 border border-yellow-600/50 text-yellow-100 text-xs sm:text-sm px-4 py-2 rounded-xl shadow-lg z-30 max-w-[92%] text-center backdrop-blur">
+    </div>
+
     <div
-        class="fixed bottom-2 sm:bottom-4 left-1/2 transform -translate-x-1/2 bg-gray-800/95 backdrop-blur px-3 safe-pb pt-3 rounded-2xl shadow-2xl border border-gray-600 flex flex-col items-center gap-3 z-20 w-[96%] max-w-md sm:max-w-lg transition-all">
+        class="fixed bottom-0 left-1/2 transform -translate-x-1/2 bg-gray-800/95 backdrop-blur px-3 safe-pb pt-3 rounded-t-2xl sm:rounded-2xl sm:bottom-4 shadow-2xl border border-gray-600 flex flex-col items-center gap-3 z-20 w-full sm:w-[96%] sm:max-w-lg transition-all">
         <div id="color-palette"
             class="flex gap-2 overflow-x-auto w-full pb-2 hide-scrollbar snap-x sm:flex-wrap sm:justify-center items-center px-1">
-            <!-- Цвета будут добавлены JS -->
-            <div class="flex items-center pl-1 border-l border-gray-600 sm:border-0">
-                <input type="color" id="user-custom-color"
-                    class="w-8 h-8 bg-transparent border-0 cursor-pointer p-0 shrink-0" title="Свой цвет">
-            </div>
+            <!-- Цвета палитры активного раунда добавляются JS -->
         </div>
+        <div id="no-palette-hint" class="hidden text-[11px] text-gray-400 text-center px-2 pb-1"></div>
 
-        <div class="flex gap-3 items-center w-full justify-between sm:justify-center px-2">
+        <div class="flex gap-2 items-center w-full justify-between sm:justify-center px-2">
             <button id="btn-zoom-out"
-                class="w-12 h-10 sm:w-auto sm:px-4 bg-gray-700 hover:bg-gray-600 active:bg-gray-500 rounded-lg shadow border border-gray-600 font-bold text-lg flex items-center justify-center transition-colors">
+                class="w-11 h-10 sm:w-auto sm:px-4 bg-gray-700 hover:bg-gray-600 active:bg-gray-500 rounded-lg shadow border border-gray-600 font-bold text-lg flex items-center justify-center transition-colors">
                 - <span class="hidden sm:inline ml-1 text-sm font-normal">Зум</span>
             </button>
             <button id="btn-center"
-                class="bg-gray-700 hover:bg-gray-600 active:bg-gray-500 px-3 py-1 rounded-lg border border-gray-600 text-xs font-bold transition-colors">
+                class="bg-gray-700 hover:bg-gray-600 active:bg-gray-500 px-2.5 py-1 rounded-lg border border-gray-600 text-[11px] sm:text-xs font-bold transition-colors">
                 Центр
             </button>
             <button id="btn-export-png"
-                class="bg-gray-700 hover:bg-gray-600 active:bg-gray-500 px-3 py-1 rounded-lg border border-gray-600 text-xs font-bold transition-colors flex items-center gap-1"
+                class="bg-gray-700 hover:bg-gray-600 active:bg-gray-500 px-2.5 py-1 rounded-lg border border-gray-600 text-[11px] sm:text-xs font-bold transition-colors flex items-center gap-1"
                 title="Скачать как PNG">
                 PNG
             </button>
+            <button id="btn-share"
+                class="bg-blue-700 hover:bg-blue-600 active:bg-blue-500 px-2.5 py-1 rounded-lg border border-blue-500/50 text-[11px] sm:text-xs font-bold transition-colors flex items-center gap-1"
+                title="Поделиться">
+                ⤴ Поделиться
+            </button>
             <span id="zoom-level"
-                class="text-xs sm:text-sm text-gray-400 font-mono font-bold bg-gray-900 px-3 py-1 rounded-full border border-gray-700 shadow-inner">100%</span>
+                class="hidden sm:inline text-xs sm:text-sm text-gray-400 font-mono font-bold bg-gray-900 px-3 py-1 rounded-full border border-gray-700 shadow-inner">100%</span>
             <button id="btn-zoom-in"
-                class="w-12 h-10 sm:w-auto sm:px-4 bg-gray-700 hover:bg-gray-600 active:bg-gray-500 rounded-lg shadow border border-gray-600 font-bold text-lg flex items-center justify-center transition-colors">
+                class="w-11 h-10 sm:w-auto sm:px-4 bg-gray-700 hover:bg-gray-600 active:bg-gray-500 rounded-lg shadow border border-gray-600 font-bold text-lg flex items-center justify-center transition-colors">
                 + <span class="hidden sm:inline ml-1 text-sm font-normal">Зум</span>
             </button>
         </div>
     </div>
 
     <div id="action-panel"
-        class="hidden fixed bottom-24 left-1/2 transform -translate-x-1/2 bg-gray-900/95 backdrop-blur-md px-4 py-3 rounded-2xl shadow-2xl border border-blue-500/50 flex items-center gap-4 z-40 w-[90%] max-w-xs transition-all animate-in fade-in slide-in-from-bottom-4">
+        class="hidden fixed bottom-40 sm:bottom-24 left-1/2 transform -translate-x-1/2 bg-gray-900/95 backdrop-blur-md px-4 py-3 rounded-2xl shadow-2xl border border-blue-500/50 flex items-center gap-4 z-40 w-[90%] max-w-xs transition-all animate-in fade-in slide-in-from-bottom-4">
         <div class="flex-1">
             <div class="text-[10px] text-gray-400 uppercase font-bold tracking-wider">Пиксель</div>
             <div id="action-info" class="text-sm font-mono font-bold flex items-center gap-2">
@@ -286,14 +384,6 @@
     <script>
         // === ООП АРХИТЕКТУРА ===
 
-        class AppConfig {
-            static COLORS = [
-                '#000000', '#1a1c2c', '#5d275d', '#b13e53', '#ef7d57', '#ffcd75', '#a7f070', '#38b764',
-                '#257179', '#29366f', '#3b5dc9', '#41a6f6', '#73eff7', '#f4f4f4', '#94b0c2', '#566c86'
-            ];
-            static DEFAULT_SETTINGS = { canvas_size: 50, cooldown: 2, grid_enabled: true, bg_color: '#1f2937' };
-        }
-
         class Utils {
             static confirm(title, desc) {
                 return new Promise((resolve) => {
@@ -318,6 +408,19 @@
                     }
                 });
             }
+
+            static formatDuration(ms) {
+                if (ms <= 0) return '0с';
+                const totalSeconds = Math.ceil(ms / 1000);
+                const days = Math.floor(totalSeconds / 86400);
+                const hours = Math.floor((totalSeconds % 86400) / 3600);
+                const minutes = Math.floor((totalSeconds % 3600) / 60);
+                const seconds = totalSeconds % 60;
+                if (days > 0) return `${days}д ${hours}ч`;
+                if (hours > 0) return `${hours}ч ${minutes}м`;
+                if (minutes > 0) return `${minutes}м ${seconds}с`;
+                return `${seconds}с`;
+            }
         }
 
         class NetworkService {
@@ -328,15 +431,14 @@
                 const statusIndicator = document.getElementById('connection-status');
 
                 this.socket.on('connect', () => {
-                    console.log('Подключено к серверу');
                     statusIndicator.classList.remove('bg-red-500', 'animate-pulse', 'shadow-[0_0_8px_rgba(239,68,68,0.8)]');
                     statusIndicator.classList.add('bg-green-500', 'shadow-[0_0_8px_rgba(34,197,94,0.8)]');
                     statusIndicator.title = "Подключено";
                 });
 
                 this.socket.on('user_status', (data) => {
-                    if (data.lastPlaced) {
-                        this.app.uiManager.restoreCooldown(data.lastPlaced);
+                    if (data && data.remainingCooldownMs > 0) {
+                        this.app.uiManager.restoreCooldown(data.remainingCooldownMs);
                     }
                 });
 
@@ -351,7 +453,11 @@
                         this.app.userId = data.userId;
                         document.getElementById('user-info').innerText = data.userId;
                     }
-                    this.app.updateSettings(data.settings);
+                    if (typeof data.serverTime === 'number') {
+                        this.app.timeOffsetMs = data.serverTime - Date.now();
+                    }
+                    this.app.applyRoundState(data.round, data.upcoming);
+                    if (typeof data.onlineCount === 'number') this.app.applyOnlineCount(data.onlineCount);
                     this.app.canvasManager.loadPixels(data.pixels);
                 });
 
@@ -363,8 +469,18 @@
                     this.app.canvasManager.clearPixel(data.x, data.y);
                 });
 
-                this.socket.on('settings_updated', (settings) => {
-                    this.app.updateSettings(settings);
+                this.socket.on('round_updated', (data) => {
+                    this.app.applyRoundState(data.round || this.app.round, data.upcoming !== undefined ? data.upcoming : this.app.upcoming);
+                });
+
+                this.socket.on('round_stats', (data) => {
+                    if (this.app.round && data.roundId === this.app.round.id) {
+                        document.getElementById('round-pixel-count').innerText = data.pixelsPlaced;
+                    }
+                });
+
+                this.socket.on('presence_update', (data) => {
+                    this.app.applyOnlineCount(data.online);
                 });
 
                 this.socket.on('canvas_cleared', () => {
@@ -391,6 +507,11 @@
 
                 this.pixelsMap = new Map();
                 this.highlightedPixel = null;
+
+                this.canvas.width = 1;
+                this.canvas.height = 1;
+                this.gridCanvas.width = 1;
+                this.gridCanvas.height = 1;
 
                 this.scale = 20;
                 this.offsetX = 0;
@@ -481,7 +602,7 @@
                 this.highlight.classList.add('hidden');
             }
 
-            exportToPNG() {
+            toCanvasBlob() {
                 const tempCanvas = document.createElement('canvas');
                 tempCanvas.width = this.canvas.width;
                 tempCanvas.height = this.canvas.height;
@@ -491,10 +612,17 @@
                 tempCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
                 tempCtx.drawImage(this.canvas, 0, 0);
 
+                return new Promise((resolve) => tempCanvas.toBlob(resolve, 'image/png'));
+            }
+
+            async exportToPNG() {
+                const blob = await this.toCanvasBlob();
+                const url = URL.createObjectURL(blob);
                 const link = document.createElement('a');
                 link.download = `pixel-battle-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
-                link.href = tempCanvas.toDataURL('image/png');
+                link.href = url;
                 link.click();
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
             }
 
             drawGrid() {
@@ -524,7 +652,7 @@
                     this.cursor.style.width = `${this.scale}px`;
                     this.cursor.style.height = `${this.scale}px`;
                     this.cursor.style.transform = `translate(${this.offsetX + x * this.scale}px, ${this.offsetY + y * this.scale}px)`;
-                    this.cursor.style.borderColor = this.app.uiManager.currentColor;
+                    this.cursor.style.borderColor = this.app.uiManager.currentColor || '#ffffff';
                 } else {
                     this.cursor.style.display = 'none';
                 }
@@ -554,6 +682,7 @@
                 document.getElementById('btn-zoom-out').addEventListener('click', () => this.zoom(-(this.scale * 0.3)));
                 document.getElementById('btn-center').addEventListener('click', () => this.centerCanvas());
                 document.getElementById('btn-export-png').addEventListener('click', () => this.exportToPNG());
+                document.getElementById('btn-share').addEventListener('click', () => this.app.shareCanvas());
 
                 this.container.addEventListener('wheel', (e) => {
                     e.preventDefault();
@@ -645,34 +774,44 @@
         class UIManager {
             constructor(app) {
                 this.app = app;
-                this.currentColor = AppConfig.COLORS[0];
+                this.currentColor = null;
                 this.lastPlacedTime = 0;
+                this.cooldownDurationMs = 0;
                 this.cooldownInterval = null;
-                this.buildPalette();
             }
 
-            buildPalette() {
+            buildPalette(palette) {
                 const container = document.getElementById('color-palette');
-                AppConfig.COLORS.forEach(color => {
+                const hint = document.getElementById('no-palette-hint');
+                container.innerHTML = '';
+
+                if (!Array.isArray(palette) || palette.length === 0) {
+                    this.currentColor = null;
+                    hint.classList.remove('hidden');
+                    hint.innerText = 'Палитра появится, когда начнётся раунд.';
+                    return;
+                }
+
+                hint.classList.add('hidden');
+                if (!palette.includes(this.currentColor)) {
+                    this.currentColor = palette[0];
+                }
+
+                palette.forEach(color => {
                     const btn = document.createElement('button');
                     btn.className = 'color-btn snap-center shrink-0';
                     btn.style.backgroundColor = color;
+                    btn.setAttribute('aria-label', color);
                     if (color === this.currentColor) btn.classList.add('active');
 
                     btn.onclick = () => {
-                        document.querySelectorAll('.color-btn').forEach(b => b.classList.remove('active'));
+                        container.querySelectorAll('.color-btn').forEach(b => b.classList.remove('active'));
                         btn.classList.add('active');
                         this.currentColor = color;
                         btn.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
                     };
-                    container.prepend(btn);
+                    container.appendChild(btn);
                 });
-
-                const customPicker = document.getElementById('user-custom-color');
-                customPicker.oninput = (e) => {
-                    this.currentColor = e.target.value;
-                    document.querySelectorAll('.color-btn').forEach(b => b.classList.remove('active'));
-                };
             }
 
             updateZoomText(scale) {
@@ -680,32 +819,37 @@
             }
 
             canPlacePixel() {
+                if (!this.app.isRoundActive()) return false;
                 const now = Date.now();
-                return (now - this.lastPlacedTime) >= (this.app.settings.cooldown * 1000);
+                return (now - this.lastPlacedTime) >= this.cooldownDurationMs;
             }
 
-            restoreCooldown(lastPlacedTime) {
-                this.lastPlacedTime = parseInt(lastPlacedTime);
-                if (!this.canPlacePixel()) {
-                    this.startCooldown(true);
-                }
+            restoreCooldown(remainingMs) {
+                this.cooldownDurationMs = (this.app.round ? this.app.round.cooldown : 0) * 1000;
+                this.lastPlacedTime = Date.now() - (this.cooldownDurationMs - remainingMs);
+                this.startCooldown(true);
             }
 
             startCooldown(isRestore = false) {
+                this.cooldownDurationMs = (this.app.round ? this.app.round.cooldown : 0) * 1000;
+                if (this.cooldownDurationMs <= 0) return;
                 if (!isRestore) this.lastPlacedTime = Date.now();
+
                 const box = document.getElementById('cooldown-box');
                 const timerText = document.getElementById('cooldown-timer');
+                const fill = document.getElementById('cooldown-bar-fill');
                 box.classList.remove('hidden');
                 box.classList.add('flex');
                 clearInterval(this.cooldownInterval);
                 this.cooldownInterval = setInterval(() => {
-                    const elapsed = Math.floor((Date.now() - this.lastPlacedTime) / 1000);
-                    const remaining = this.app.settings.cooldown - elapsed;
-                    if (remaining <= 0) {
+                    const elapsedMs = Date.now() - this.lastPlacedTime;
+                    const remainingMs = this.cooldownDurationMs - elapsedMs;
+                    if (remainingMs <= 0) {
                         clearInterval(this.cooldownInterval);
                         box.classList.add('hidden');
                     } else {
-                        timerText.innerText = `${remaining}s`;
+                        timerText.innerText = `${Math.ceil(remainingMs / 1000)}s`;
+                        fill.style.width = `${Math.max(0, 100 - (elapsedMs / this.cooldownDurationMs) * 100)}%`;
                     }
                 }, 100);
             }
@@ -736,19 +880,101 @@
         class App {
             constructor() {
                 this.userId = "Connecting...";
-                this.settings = { ...AppConfig.DEFAULT_SETTINGS };
+                this.settings = { canvas_size: 1, grid_enabled: true, bg_color: '#1f2937' };
+                this.round = null;
+                this.upcoming = null;
+                this.timeOffsetMs = 0;
                 this.uiManager = new UIManager(this);
                 this.canvasManager = new CanvasManager(this);
                 this.network = new NetworkService(this);
+                setInterval(() => this.tickCountdown(), 1000);
             }
 
-            updateSettings(newSettings) {
-                if (!newSettings) return;
-                this.settings = newSettings;
-                this.canvasManager.applySettings(this.settings.canvas_size, this.settings.grid_enabled, this.settings.bg_color);
+            now() { return Date.now() + this.timeOffsetMs; }
+
+            isRoundActive() {
+                return !!(this.round && this.round.status === 'active');
+            }
+
+            applyRoundState(round, upcoming) {
+                this.round = round || null;
+                this.upcoming = upcoming || null;
+
+                if (this.round) {
+                    this.settings = {
+                        canvas_size: this.round.canvas_size,
+                        grid_enabled: this.round.grid_enabled,
+                        bg_color: this.round.bg_color
+                    };
+                    this.canvasManager.applySettings(this.round.canvas_size, this.round.grid_enabled, this.round.bg_color);
+                }
+
+                this.uiManager.buildPalette(this.isRoundActive() ? this.round.palette : []);
+                document.getElementById('round-pixel-count').innerText = this.round ? (this.round.pixelsPlaced || 0) : 0;
+                this.renderRoundBar();
+                this.renderDrawBanner();
+            }
+
+            applyOnlineCount(count) {
+                document.getElementById('online-count').innerText = count;
+            }
+
+            renderRoundBar() {
+                const badge = document.getElementById('round-status-badge');
+                const nameEl = document.getElementById('round-name');
+                badge.classList.remove('status-active', 'status-upcoming', 'status-finished', 'status-none');
+
+                if (this.round && this.round.status === 'active') {
+                    badge.classList.add('status-active');
+                    badge.innerText = 'Идёт';
+                    nameEl.innerText = this.round.name;
+                } else if (this.upcoming) {
+                    badge.classList.add('status-upcoming');
+                    badge.innerText = 'Скоро начнётся';
+                    nameEl.innerText = this.upcoming.name;
+                } else if (this.round && this.round.status === 'finished') {
+                    badge.classList.add('status-finished');
+                    badge.innerText = 'Завершён';
+                    nameEl.innerText = this.round.name;
+                } else {
+                    badge.classList.add('status-none');
+                    badge.innerText = 'Нет раунда';
+                    nameEl.innerText = '';
+                }
+            }
+
+            tickCountdown() {
+                const el = document.getElementById('round-countdown');
+                if (this.round && this.round.status === 'active') {
+                    const remaining = new Date(this.round.ends_at).getTime() - this.now();
+                    el.innerText = remaining > 0 ? `осталось: ${Utils.formatDuration(remaining)}` : 'завершается…';
+                } else if (this.upcoming) {
+                    const remaining = new Date(this.upcoming.starts_at).getTime() - this.now();
+                    el.innerText = remaining > 0 ? `начало через: ${Utils.formatDuration(remaining)}` : 'вот-вот начнётся';
+                } else {
+                    el.innerText = '';
+                }
+            }
+
+            renderDrawBanner() {
+                const banner = document.getElementById('draw-disabled-banner');
+                if (this.isRoundActive()) {
+                    banner.classList.add('hidden');
+                    return;
+                }
+                banner.classList.remove('hidden');
+                if (this.upcoming) {
+                    banner.innerText = `Рисование недоступно: раунд «${this.upcoming.name}» ещё не начался.`;
+                } else if (this.round && this.round.status === 'finished') {
+                    banner.innerText = `Раунд «${this.round.name}» завершён. Рисование недоступно, но холст сохранён в архиве.`;
+                } else {
+                    banner.innerText = 'Рисование недоступно: активных раундов пока нет.';
+                }
             }
 
             async placePixel(x, y) {
+                if (!this.isRoundActive()) return;
+                if (!this.uiManager.currentColor) return;
                 if (!this.uiManager.canPlacePixel()) return;
                 const color = this.uiManager.currentColor;
                 this.canvasManager.showHighlight(x, y, color);
@@ -758,6 +984,40 @@
                 this.canvasManager.drawPixel(x, y, color);
                 this.uiManager.startCooldown();
                 this.network.sendPixel(x, y, color);
+            }
+
+            async shareCanvas() {
+                const blob = await this.canvasManager.toCanvasBlob();
+                const isFinished = this.round && this.round.status === 'finished';
+                const permalink = isFinished
+                    ? `${location.origin}/archive/${this.round.id}`
+                    : location.href;
+                const title = this.round ? this.round.name : 'Pixel Battle';
+                const filename = `pixel-battle-${this.round ? this.round.id : 'canvas'}.png`;
+
+                if (navigator.share) {
+                    try {
+                        const file = new File([blob], filename, { type: 'image/png' });
+                        const shareData = navigator.canShare && navigator.canShare({ files: [file] })
+                            ? { files: [file], title, text: title, url: permalink }
+                            : { title, text: title, url: permalink };
+                        await navigator.share(shareData);
+                        return;
+                    } catch (e) {
+                        // Пользователь отменил или Web Share недоступен для файлов - используем запасной вариант
+                    }
+                }
+
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.download = filename;
+                link.href = url;
+                link.click();
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+                if (isFinished && navigator.clipboard) {
+                    try { await navigator.clipboard.writeText(permalink); } catch (e) { /* тихо игнорируем */ }
+                }
             }
         }
 

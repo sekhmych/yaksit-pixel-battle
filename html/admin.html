@@ -9,55 +9,13 @@
     <link rel="stylesheet" href="/tailwind.css">
     <script src="/socket.io.min.js"></script>
 </head>
-<body class="bg-gray-900 text-white min-h-screen p-4 sm:p-8" x-data="{ 
-    activeTab: 'canvas', 
-    role: 'user',
-    moderators: [],
-    newMod: { username: '', password: '' },
-    init(data) {
-        this.role = data.role;
-        if (this.role === 'admin') {
-            this.loadModerators();
-        }
-    },
-    async loadModerators() {
-        emitWithAuth('list_moderators', {}, (res) => {
-            if (res.success) this.moderators = res.moderators;
-        });
-    },
-    async createModerator() {
-        if (!this.newMod.username || !this.newMod.password) return;
-        emitWithAuth('create_moderator', this.newMod, (res) => {
-            if (res.success) {
-                this.loadModerators();
-                this.newMod = { username: '', password: '' };
-            } else { alert(res.error || 'Ошибка'); }
-        });
-    },
-    async deleteModerator(username) {
-        if (confirm(`Удалить модератора ${username}?`)) {
-            emitWithAuth('delete_moderator', { username }, (res) => {
-                if (res.success) this.loadModerators();
-            });
-        }
-    },
-    async changePassword(username) {
-        const newPassword = prompt(`Введите новый пароль для ${username}:`);
-        if (!newPassword) return;
-        emitWithAuth('update_moderator_password', { username, newPassword }, (res) => {
-            if (res.success) {
-                alert('Пароль успешно изменен');
-            } else {
-                alert('Ошибка при смене пароля');
-            }
-        });
-    }
-}">
+<body class="bg-gray-900 text-white min-h-screen p-4 sm:p-8" x-data="adminApp()">
     <div class="max-w-6xl mx-auto">
         <div class="flex justify-between items-center mb-6 border-b border-gray-800 pb-4">
             <h1 class="text-xl font-bold text-red-400 uppercase tracking-widest">⚙️ Панель управления</h1>
             <div class="flex gap-4">
                 <a href="/" class="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded transition text-sm">К холсту</a>
+                <a href="/archive" class="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded transition text-sm">Архив</a>
                 <a href="/admin/logout" class="px-4 py-2 bg-red-900/50 hover:bg-red-800 rounded transition text-sm text-red-200">Выйти</a>
             </div>
         </div>
@@ -67,7 +25,7 @@
             <button @click="activeTab = 'canvas'; $nextTick(() => window.centerCanvas())" :class="activeTab === 'canvas' ? 'active-tab' : ''" class="tab-btn px-6 py-2 rounded-lg font-bold text-sm transition">Холст</button>
             <template x-if="role === 'admin'">
                 <div class="flex gap-2">
-                    <button @click="activeTab = 'settings'" :class="activeTab === 'settings' ? 'active-tab' : ''" class="tab-btn px-6 py-2 rounded-lg font-bold text-sm transition">Настройки</button>
+                    <button @click="activeTab = 'rounds'; loadRounds()" :class="activeTab === 'rounds' ? 'active-tab' : ''" class="tab-btn px-6 py-2 rounded-lg font-bold text-sm transition">Раунды</button>
                     <button @click="activeTab = 'moderators'" :class="activeTab === 'moderators' ? 'active-tab' : ''" class="tab-btn px-6 py-2 rounded-lg font-bold text-sm transition">Модераторы</button>
                     <button @click="activeTab = 'history'" :class="activeTab === 'history' ? 'active-tab' : ''" class="tab-btn px-6 py-2 rounded-lg font-bold text-sm transition">История</button>
                     <button @click="activeTab = 'system'" :class="activeTab === 'system' ? 'active-tab' : ''" class="tab-btn px-6 py-2 rounded-lg font-bold text-sm transition">Система</button>
@@ -77,6 +35,9 @@
 
         <!-- Контент табов -->
         <div x-show="activeTab === 'canvas'" class="tab-content space-y-6">
+            <div class="bg-yellow-900/30 border border-yellow-700/50 text-yellow-200 text-xs sm:text-sm rounded-xl px-4 py-3" x-show="!currentRound || currentRound.status !== 'active'">
+                Нет активного раунда - рисование на холсте недоступно даже для администраторов. Запустите раунд во вкладке «Раунды».
+            </div>
             <div id="admin-canvas-section" class="bg-gray-800 p-4 sm:p-6 rounded-2xl border border-gray-700 shadow-xl flex flex-col h-[700px] transition-all">
                 <div class="flex justify-between items-center mb-4">
                     <h2 class="text-lg font-bold text-purple-400">Живое управление</h2>
@@ -86,13 +47,10 @@
                         </svg>
                     </button>
                 </div>
-                
+
                 <!-- Палитра и инструменты -->
                 <div class="flex flex-wrap gap-2 mb-4 bg-gray-900 p-3 rounded-xl border border-gray-700 items-center">
                     <div id="admin-palette" class="flex gap-1 overflow-x-auto pb-1 hide-scrollbar"></div>
-                    <div class="flex items-center gap-2 border-l border-gray-700 pl-2">
-                        <input type="color" id="admin-custom-color" class="w-8 h-8 bg-transparent border-0 cursor-pointer p-0" title="Свой цвет">
-                    </div>
                     <div class="flex gap-2 border-l border-gray-700 pl-2">
                         <button id="tool-draw" class="px-3 py-1 bg-blue-600 rounded text-xs font-bold active-tool">КИСТЬ</button>
                         <button id="tool-delete" class="px-3 py-1 bg-gray-700 hover:bg-red-600 rounded text-xs font-bold">ЛАСТИК</button>
@@ -125,39 +83,113 @@
             </div>
         </div>
 
-        <div x-show="activeTab === 'settings'" x-cloak class="tab-content space-y-6">
-            <div class="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl max-w-2xl">
-                <h2 class="text-lg font-bold mb-6 text-blue-400">Настройки холста</h2>
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                    <div class="space-y-4">
+        <!-- РАУНДЫ -->
+        <div x-show="activeTab === 'rounds'" x-cloak class="tab-content space-y-6">
+            <div class="flex justify-between items-center">
+                <h2 class="text-lg font-bold text-blue-400">Управление раундами</h2>
+                <button @click="openEditor(null)" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg font-bold text-sm shadow-lg">+ Новый раунд</button>
+            </div>
+
+            <div class="grid grid-cols-1 gap-3">
+                <template x-for="r in rounds" :key="r.id">
+                    <div class="bg-gray-800 border border-gray-700 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
+                        <div class="min-w-0">
+                            <div class="flex items-center gap-2 flex-wrap">
+                                <span class="status-chip" :class="'status-chip-' + r.status" x-text="statusLabel(r.status)"></span>
+                                <span class="font-bold truncate" x-text="r.name"></span>
+                            </div>
+                            <div class="text-[11px] text-gray-500 mt-1 font-mono">
+                                <span x-text="fmt(r.starts_at)"></span> &rarr; <span x-text="fmt(r.ends_at)"></span>
+                                &middot; холст <span x-text="r.canvas_size"></span>x<span x-text="r.canvas_size"></span>
+                                &middot; кулдаун <span x-text="r.cooldown"></span>с
+                                &middot; <span x-text="(r.palette || []).length"></span> цветов
+                            </div>
+                        </div>
+                        <div class="flex gap-2 shrink-0">
+                            <button x-show="r.status !== 'finished'" @click="openEditor(r)" class="px-3 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-xs font-bold">Изменить</button>
+                            <button x-show="r.status === 'draft'" @click="confirmStart(r)" class="px-3 py-2 bg-green-700 hover:bg-green-600 rounded-lg text-xs font-bold">Запустить</button>
+                            <button x-show="r.status === 'active'" @click="confirmFinish(r)" class="px-3 py-2 bg-red-700 hover:bg-red-600 rounded-lg text-xs font-bold">Завершить</button>
+                            <a x-show="r.status === 'finished'" :href="'/archive/' + r.id" target="_blank" class="px-3 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-xs font-bold">В архиве</a>
+                        </div>
+                    </div>
+                </template>
+                <div x-show="rounds.length === 0" class="text-center py-10 text-gray-500 italic">Раундов пока нет. Создайте первый черновик.</div>
+            </div>
+
+            <!-- Редактор раунда -->
+            <div x-show="editorOpen" x-cloak class="fixed inset-0 z-[90] bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+                <div @click.away="editorOpen = false" class="bg-gray-800 border border-gray-700 rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto p-6 space-y-5">
+                    <h3 class="text-lg font-bold text-blue-400" x-text="form.id ? 'Изменить раунд' : 'Новый раунд (черновик)'"></h3>
+
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div class="md:col-span-2">
+                            <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Название</label>
+                            <input type="text" x-model="form.name" maxlength="200" class="w-full bg-gray-900 border border-gray-700 p-2.5 rounded-lg outline-none focus:border-blue-500">
+                        </div>
+                        <div class="md:col-span-2">
+                            <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Описание (необязательно)</label>
+                            <textarea x-model="form.description" rows="2" maxlength="2000" class="w-full bg-gray-900 border border-gray-700 p-2.5 rounded-lg outline-none focus:border-blue-500"></textarea>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Начало</label>
+                            <input type="datetime-local" x-model="form.starts_at" :disabled="form.id && !form.isDraft" class="w-full bg-gray-900 border border-gray-700 p-2.5 rounded-lg outline-none focus:border-blue-500 disabled:opacity-40">
+                        </div>
+                        <div>
+                            <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Окончание</label>
+                            <input type="datetime-local" x-model="form.ends_at" class="w-full bg-gray-900 border border-gray-700 p-2.5 rounded-lg outline-none focus:border-blue-500">
+                        </div>
                         <div>
                             <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Размер холста</label>
-                            <input type="number" id="admin-size" class="w-full bg-gray-900 border border-gray-700 p-3 rounded-lg focus:border-blue-500 outline-none transition">
+                            <input type="number" min="10" max="1000" x-model.number="form.canvas_size" :disabled="form.id && !form.isDraft" class="w-full bg-gray-900 border border-gray-700 p-2.5 rounded-lg outline-none focus:border-blue-500 disabled:opacity-40">
                         </div>
                         <div>
                             <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Кулдаун (сек)</label>
-                            <input type="number" id="admin-cooldown" class="w-full bg-gray-900 border border-gray-700 p-3 rounded-lg focus:border-blue-500 outline-none transition">
+                            <input type="number" min="0" max="3600" x-model.number="form.cooldown" class="w-full bg-gray-900 border border-gray-700 p-2.5 rounded-lg outline-none focus:border-blue-500">
                         </div>
-                    </div>
-                    <div class="space-y-4">
                         <div>
                             <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Цвет фона</label>
-                            <input type="color" id="admin-bg-color" class="w-full h-12 bg-gray-900 border border-gray-700 p-1 rounded-lg cursor-pointer">
+                            <input type="color" x-model="form.bg_color" class="w-full h-11 bg-gray-900 border border-gray-700 p-1 rounded-lg cursor-pointer">
                         </div>
                         <label class="flex items-center gap-3 p-3 bg-gray-900 rounded-lg border border-gray-700 cursor-pointer select-none">
-                            <input type="checkbox" id="admin-grid" class="w-5 h-5 accent-blue-500">
+                            <input type="checkbox" x-model="form.grid_enabled" class="w-5 h-5 accent-blue-500">
                             <span class="text-sm font-bold text-gray-300">Отображать сетку</span>
                         </label>
                     </div>
+
+                    <div>
+                        <label class="block text-xs font-bold text-gray-500 uppercase mb-2">Палитра (доступные цвета для игроков)</label>
+                        <div class="flex flex-wrap gap-2 mb-3">
+                            <template x-for="color in form.palette" :key="color">
+                                <div class="flex items-center gap-1 bg-gray-900 border border-gray-700 rounded-lg pl-1 pr-2 py-1">
+                                    <span class="w-6 h-6 rounded border border-white/20" :style="'background-color:' + color"></span>
+                                    <span class="text-[11px] font-mono text-gray-300" x-text="color"></span>
+                                    <button @click="removePaletteColor(color)" class="text-gray-500 hover:text-red-400 font-bold px-1" title="Удалить цвет">&times;</button>
+                                </div>
+                            </template>
+                            <div x-show="form.palette.length === 0" class="text-xs text-red-400 italic py-2">Палитра пуста - раунд нельзя сохранить без цветов.</div>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <input type="color" x-model="newPaletteColor" class="w-10 h-10 bg-transparent border-0 cursor-pointer p-0">
+                            <input type="text" x-model="newPaletteColorText" placeholder="#RRGGBB" maxlength="7" class="bg-gray-900 border border-gray-700 p-2 rounded-lg text-sm font-mono w-28 outline-none focus:border-blue-500">
+                            <button @click="addPaletteColor()" class="px-3 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-xs font-bold">Добавить цвет</button>
+                        </div>
+                        <p class="text-[11px] text-gray-500 mt-2">Сервер отклонит любой пиксель с цветом вне этой палитры, даже если запрос отправлен напрямую.</p>
+                    </div>
+
+                    <p x-show="formError" x-text="formError" class="text-sm text-red-400 bg-red-900/20 border border-red-700/40 rounded-lg px-3 py-2"></p>
+
+                    <div class="flex justify-end gap-3 pt-2 border-t border-gray-700">
+                        <button @click="editorOpen = false" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg font-medium">Отмена</button>
+                        <button @click="saveRound()" class="px-6 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg font-bold shadow-lg">Сохранить</button>
+                    </div>
                 </div>
-                <button id="btn-save-settings" class="mt-8 w-full bg-blue-600 hover:bg-blue-500 py-4 rounded-xl font-bold shadow-lg transition uppercase tracking-widest">Применить настройки</button>
             </div>
         </div>
 
         <div x-show="activeTab === 'moderators'" x-cloak class="tab-content space-y-6">
             <div class="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl max-w-2xl">
                 <h2 class="text-lg font-bold mb-6 text-green-400">Управление модераторами</h2>
-                
+
                 <!-- Создание -->
                 <div class="bg-gray-900 p-4 rounded-xl border border-gray-700 mb-8">
                     <h3 class="text-sm font-bold text-gray-400 uppercase mb-4">Создать нового модератора</h3>
@@ -198,7 +230,7 @@
             </div>
         </div>
 
-        <div x-show="activeTab === 'history'" x-cloak class="tab-content space-y-6" x-data="{ 
+        <div x-show="activeTab === 'history'" x-cloak class="tab-content space-y-6" x-data="{
             rollback: { x1: 0, y1: 0, x2: 10, y2: 10, time: 60 },
             async applyRollback() {
                 if (confirm(`Откатить область [${this.rollback.x1},${this.rollback.y1}] - [${this.rollback.x2},${this.rollback.y2}] на ${this.rollback.time} мин?`)) {
@@ -210,7 +242,7 @@
                         timeAgoMinutes: parseInt(this.rollback.time)
                     }, (res) => {
                         if (res.success) alert(`Откат завершен! Обновлено пикселей: ${res.count}`);
-                        else alert('Ошибка при откате');
+                        else alert(res.error || 'Ошибка при откате');
                     });
                 }
             }
@@ -219,6 +251,7 @@
                 <!-- Откат области -->
                 <div class="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl">
                     <h2 class="text-lg font-bold mb-6 text-orange-400 italic">⏪ Откат области (Rollback)</h2>
+                    <p class="text-[11px] text-gray-500 -mt-4 mb-4">Действует только внутри активного раунда.</p>
                     <div class="space-y-4">
                         <div class="grid grid-cols-2 gap-4">
                             <div>
@@ -255,11 +288,11 @@
                             </svg>
                         </div>
                         <div>
-                            <p class="text-sm text-gray-300">Сервер делает снимки холста каждые 10 минут.</p>
+                            <p class="text-sm text-gray-300">Сервер делает снимки холста активного раунда каждые 10 минут.</p>
                             <p class="text-xs text-gray-500 mt-1">Все снимки хранятся в базе данных в бинарном виде.</p>
                         </div>
                         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full">
-                            <button @click="emitWithAuth('create_manual_snapshot', {}, (res) => { if(res.success) alert('Снимок создан!'); })" 
+                            <button @click="emitWithAuth('create_manual_snapshot', {}, (res) => { if(res.success) alert('Снимок создан!'); })"
                                     class="bg-gray-700 hover:bg-gray-600 py-3 rounded-xl font-bold transition flex items-center justify-center gap-2 text-xs">
                                 📸 СОЗДАТЬ СЕЙЧАС
                             </button>
@@ -276,7 +309,7 @@
             <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
                 <!-- Бэкап -->
                 <div class="bg-gray-800 p-6 rounded-2xl border border-gray-700 shadow-xl">
-                    <h2 class="text-lg font-bold mb-4 text-green-400">База данных</h2>
+                    <h2 class="text-lg font-bold mb-4 text-green-400">База данных активного раунда</h2>
                     <div class="grid grid-cols-2 gap-4">
                         <button id="btn-export" class="bg-gray-700 hover:bg-gray-600 py-4 rounded-xl text-sm font-bold transition flex flex-col items-center gap-2">
                             <span>📥 Экспорт</span>
@@ -288,10 +321,10 @@
                         </button>
                     </div>
                     <input type="file" id="import-file" class="hidden" accept=".json">
-                    
+
                     <div class="mt-6 pt-6 border-t border-gray-700">
                         <button id="btn-nuke" class="w-full bg-red-900/30 hover:bg-red-600 border border-red-500/50 text-red-200 hover:text-white py-3 rounded-lg font-bold transition">
-                            💥 ПОЛНАЯ ОЧИСТКА ХОЛСТА
+                            💥 ОЧИСТИТЬ ХОЛСТ АКТИВНОГО РАУНДА
                         </button>
                     </div>
                 </div>
@@ -316,7 +349,12 @@
         .hide-scrollbar::-webkit-scrollbar { display: none; }
         .hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
         #admin-pixelCanvas { outline: 1px solid #000000; }
-        
+
+        .status-chip { font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em; padding: 2px 8px; border-radius: 999px; }
+        .status-chip-draft { background: rgba(148,163,184,0.15); color: #94a3b8; border: 1px solid rgba(148,163,184,0.35); }
+        .status-chip-active { background: rgba(34,197,94,0.2); color: #4ade80; border: 1px solid rgba(74,222,128,0.4); }
+        .status-chip-finished { background: rgba(59,130,246,0.15); color: #60a5fa; border: 1px solid rgba(96,165,250,0.35); }
+
         /* Полноэкранный режим */
         #admin-canvas-section:fullscreen {
             padding: 20px;
@@ -327,18 +365,186 @@
     </style>
 
     <script>
+        function adminApp() {
+            return {
+                activeTab: 'canvas',
+                role: 'user',
+                moderators: [],
+                newMod: { username: '', password: '' },
+                rounds: [],
+                currentRound: null,
+                editorOpen: false,
+                form: emptyForm(),
+                newPaletteColor: '#ffffff',
+                newPaletteColorText: '',
+                formError: '',
+
+                init() {
+                    // role/currentRound синхронизируются из vanilla-скрипта ниже через window.syncAdminAlpine
+                    window.syncAdminAlpine = (data) => {
+                        this.role = data.role;
+                        this.currentRound = data.round || null;
+                        if (this.role === 'admin' && this.activeTab === 'rounds') this.loadRounds();
+                        if (this.role === 'admin') this.loadModerators();
+                    };
+                    window.onAdminRoundsChanged = () => { if (this.activeTab === 'rounds') this.loadRounds(); };
+                },
+
+                statusLabel(status) {
+                    return status === 'draft' ? 'Черновик' : status === 'active' ? 'Активен' : 'Завершён';
+                },
+                fmt(dateStr) {
+                    if (!dateStr) return '-';
+                    return new Date(dateStr).toLocaleString();
+                },
+
+                loadModerators() {
+                    emitWithAuth('list_moderators', {}, (res) => { if (res.success) this.moderators = res.moderators; });
+                },
+                createModerator() {
+                    if (!this.newMod.username || !this.newMod.password) return;
+                    emitWithAuth('create_moderator', this.newMod, (res) => {
+                        if (res.success) { this.loadModerators(); this.newMod = { username: '', password: '' }; }
+                        else { alert(res.error || 'Ошибка'); }
+                    });
+                },
+                deleteModerator(username) {
+                    if (confirm(`Удалить модератора ${username}?`)) {
+                        emitWithAuth('delete_moderator', { username }, (res) => { if (res.success) this.loadModerators(); });
+                    }
+                },
+                changePassword(username) {
+                    const newPassword = prompt(`Введите новый пароль для ${username}:`);
+                    if (!newPassword) return;
+                    emitWithAuth('update_moderator_password', { username, newPassword }, (res) => {
+                        alert(res.success ? 'Пароль успешно изменен' : 'Ошибка при смене пароля');
+                    });
+                },
+
+                loadRounds() {
+                    emitWithAuth('list_rounds', {}, (res) => { if (res.success) this.rounds = res.rounds; });
+                },
+
+                openEditor(round) {
+                    this.formError = '';
+                    this.newPaletteColorText = '';
+                    if (round) {
+                        this.form = {
+                            id: round.id,
+                            isDraft: round.status === 'draft',
+                            name: round.name,
+                            description: round.description || '',
+                            starts_at: toLocalInput(round.starts_at),
+                            ends_at: toLocalInput(round.ends_at),
+                            canvas_size: round.canvas_size,
+                            cooldown: round.cooldown,
+                            bg_color: round.bg_color,
+                            grid_enabled: round.grid_enabled,
+                            palette: [...(round.palette || [])]
+                        };
+                    } else {
+                        this.form = emptyForm();
+                        const now = new Date();
+                        const end = new Date(now.getTime() + 24 * 3600 * 1000);
+                        this.form.starts_at = toLocalInput(now.toISOString());
+                        this.form.ends_at = toLocalInput(end.toISOString());
+                    }
+                    this.editorOpen = true;
+                },
+
+                addPaletteColor() {
+                    let color = (this.newPaletteColorText || this.newPaletteColor || '').trim();
+                    if (!/^#[0-9a-fA-F]{6}$/.test(color)) {
+                        this.formError = 'Введите цвет в формате #RRGGBB';
+                        return;
+                    }
+                    color = color.toLowerCase();
+                    if (this.form.palette.map(c => c.toLowerCase()).includes(color)) {
+                        this.formError = 'Такой цвет уже есть в палитре';
+                        return;
+                    }
+                    this.formError = '';
+                    this.form.palette.push(color);
+                    this.newPaletteColorText = '';
+                },
+                removePaletteColor(color) {
+                    this.form.palette = this.form.palette.filter(c => c !== color);
+                },
+
+                saveRound() {
+                    if (!this.form.name || !this.form.name.trim()) { this.formError = 'Укажите название раунда'; return; }
+                    if (this.form.palette.length === 0) { this.formError = 'Добавьте хотя бы один цвет в палитру'; return; }
+                    if (!this.form.starts_at || !this.form.ends_at) { this.formError = 'Укажите время начала и окончания'; return; }
+                    const startsAtIso = new Date(this.form.starts_at).toISOString();
+                    const endsAtIso = new Date(this.form.ends_at).toISOString();
+                    if (new Date(endsAtIso) <= new Date(startsAtIso)) { this.formError = 'Окончание должно быть позже начала'; return; }
+
+                    const payload = {
+                        name: this.form.name.trim(),
+                        description: this.form.description || null,
+                        starts_at: startsAtIso,
+                        ends_at: endsAtIso,
+                        canvas_size: this.form.canvas_size,
+                        cooldown: this.form.cooldown,
+                        bg_color: this.form.bg_color,
+                        grid_enabled: !!this.form.grid_enabled,
+                        palette: this.form.palette
+                    };
+
+                    const event = this.form.id ? 'update_round' : 'create_round';
+                    if (this.form.id) payload.id = this.form.id;
+
+                    emitWithAuth(event, payload, (res) => {
+                        if (res.success) {
+                            this.editorOpen = false;
+                            this.loadRounds();
+                        } else {
+                            this.formError = res.error || 'Не удалось сохранить раунд';
+                        }
+                    });
+                },
+
+                confirmStart(round) {
+                    if (!confirm(`Запустить раунд «${round.name}»? Он станет единственным активным раундом.`)) return;
+                    emitWithAuth('start_round', { id: round.id }, (res) => {
+                        if (res.success) this.loadRounds();
+                        else alert(res.error || 'Не удалось запустить раунд');
+                    });
+                },
+                confirmFinish(round) {
+                    if (!confirm(`Завершить раунд «${round.name}»? Итоговый холст будет сохранён в архиве, рисование остановится.`)) return;
+                    emitWithAuth('finish_round', { id: round.id }, (res) => {
+                        if (res.success) this.loadRounds();
+                        else alert(res.error || 'Не удалось завершить раунд');
+                    });
+                }
+            };
+        }
+
+        function emptyForm() {
+            return {
+                id: null, isDraft: true, name: '', description: '',
+                starts_at: '', ends_at: '', canvas_size: 100, cooldown: 5,
+                bg_color: '#1f2937', grid_enabled: true, palette: [
+                    '#000000', '#1a1c2c', '#5d275d', '#b13e53', '#ef7d57', '#ffcd75', '#a7f070', '#38b764',
+                    '#257179', '#29366f', '#3b5dc9', '#41a6f6', '#73eff7', '#f4f4f4', '#94b0c2', '#566c86'
+                ]
+            };
+        }
+
+        function toLocalInput(isoStr) {
+            const d = new Date(isoStr);
+            const pad = (n) => String(n).padStart(2, '0');
+            return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        }
+
         const socket = io();
-        let currentSettings = {};
+        let activeRound = null; // текущий активный раунд (полный объект с палитрой), либо null
         const csrfMeta = document.querySelector('meta[name="csrf-token"]');
         const csrfToken = csrfMeta ? csrfMeta.getAttribute('content') : null;
 
-        const COLORS = [
-            '#000000', '#1a1c2c', '#5d275d', '#b13e53', '#ef7d57', '#ffcd75', '#a7f070', '#38b764',
-            '#257179', '#29366f', '#3b5dc9', '#41a6f6', '#73eff7', '#f4f4f4', '#94b0c2', '#566c86'
-        ];
-
         let activeTool = 'draw';
-        let activeColor = COLORS[0];
+        let activeColor = null;
 
         // Fullscreen Logic
         document.getElementById('btn-fullscreen').addEventListener('click', () => {
@@ -384,26 +590,19 @@
 
         function emitWithAuth(event, data, callback) {
             const payload = { auth: { csrfToken }, data: data };
-            if (callback) { socket.emit(event, payload, callback); } 
+            if (callback) { socket.emit(event, payload, callback); }
             else { socket.emit(event, payload); }
         }
 
         // Загрузка начальных данных
         socket.on('init_data', (data) => {
-            // Синхронизация с Alpine
-            const alpineBody = document.body._x_dataStack[0];
-            if (alpineBody) {
-                alpineBody.role = data.role;
-                if (data.role === 'admin') {
-                    alpineBody.loadModerators();
-                }
-            }
+            if (window.syncAdminAlpine) window.syncAdminAlpine(data);
 
-            currentSettings = data.settings;
-            updateInputs(data.settings);
-            initCanvas(data.settings.canvas_size);
+            activeRound = (data.round && data.round.status === 'active') ? data.round : null;
+            applyRoundToCanvas(data.round);
             loadPixels(data.pixels);
-            
+            buildPalette();
+
             if (data.adminLogs) {
                 const log = document.getElementById('admin-log');
                 log.innerHTML = '';
@@ -411,17 +610,17 @@
             }
         });
 
-        socket.on('admin_log_entry', (entry) => {
-            addLogEntry(entry);
-        });
+        socket.on('admin_log_entry', (entry) => addLogEntry(entry));
+        socket.on('admin_rounds_changed', () => { if (window.onAdminRoundsChanged) window.onAdminRoundsChanged(); });
 
-        socket.on('settings_updated', (settings) => {
-            currentSettings = settings;
-            updateInputs(settings);
-            if (canvas.width !== settings.canvas_size) {
-                initCanvas(settings.canvas_size);
+        socket.on('round_updated', (data) => {
+            if (window.syncAdminAlpine && (data.round || data.upcoming)) {
+                // подсинхронизируем alpine-состояние текущего раунда, если это он
             }
-            updateGrid();
+            if (data.round) {
+                activeRound = data.round.status === 'active' ? data.round : null;
+                applyRoundToCanvas(data.round);
+            }
         });
 
         socket.on('pixel_update', (pixel) => {
@@ -437,23 +636,28 @@
             ctx.clearRect(0, 0, canvas.width, canvas.height);
         });
 
-        function updateInputs(s) {
-            document.getElementById('admin-size').value = s.canvas_size;
-            document.getElementById('admin-cooldown').value = s.cooldown;
-            document.getElementById('admin-grid').checked = s.grid_enabled;
-            document.getElementById('admin-bg-color').value = s.bg_color;
-            container.style.backgroundColor = s.bg_color;
+        function applyRoundToCanvas(round) {
+            if (!round) return;
+            if (canvas.width !== round.canvas_size) {
+                initCanvas(round.canvas_size);
+            }
+            container.style.backgroundColor = round.bg_color;
+            updateGrid(round.grid_enabled);
         }
 
         function addLogEntry(entry) {
             const log = document.getElementById('admin-log');
             const li = document.createElement('li');
             const time = new Date(entry.created_at).toLocaleTimeString();
-            
+
             let detailsStr = '';
-            if (entry.action === 'UPDATE_SETTINGS') detailsStr = 'обновил настройки';
+            if (entry.action === 'CREATE_ROUND') detailsStr = `создал раунд «${entry.details.name}»`;
+            if (entry.action === 'UPDATE_ROUND') detailsStr = `изменил раунд «${entry.details.name}»`;
+            if (entry.action === 'START_ROUND') detailsStr = `запустил раунд «${entry.details.name}»`;
+            if (entry.action === 'FINISH_ROUND') detailsStr = `завершил раунд «${entry.details.name}»`;
+            if (entry.action === 'AUTO_FINISH_ROUND') detailsStr = `раунд «${entry.details.name}» завершён автоматически`;
             if (entry.action === 'CLEAR_CANVAS') detailsStr = '💥 ОЧИСТИЛ ХОЛСТ';
-            if (entry.action === 'EXPORT_DB') detailsStr = 'экспортировал БД';
+            if (entry.action === 'EXPORT_DB') detailsStr = 'экспортировал БД раунда';
             if (entry.action === 'IMPORT_DB') detailsStr = `импортировал БД (${entry.details.pixelCount} px)`;
             if (entry.action === 'SET_PIXEL') detailsStr = `нарисовал пиксель [${entry.details.x}, ${entry.details.y}] цвет ${entry.details.color}`;
             if (entry.action === 'DELETE_PIXEL') detailsStr = `удалил пиксель [${entry.details.x}, ${entry.details.y}]`;
@@ -501,9 +705,10 @@
             updateGrid();
         }
 
-        function updateGrid() {
+        function updateGrid(gridEnabled) {
+            const enabled = gridEnabled !== undefined ? gridEnabled : (activeRound ? activeRound.grid_enabled : true);
             gridCtx.clearRect(0, 0, gridLayer.width, gridLayer.height);
-            if (!currentSettings.grid_enabled || scale < 5) return;
+            if (!enabled || scale < 5) return;
             gridCtx.strokeStyle = 'rgba(255,255,255,0.2)';
             gridCtx.lineWidth = 1 / scale;
             gridCtx.beginPath();
@@ -522,12 +727,14 @@
         }
 
         function applyTool(clientX, clientY) {
+            if (!activeRound) return; // рисование доступно только внутри активного раунда
+            if (activeTool === 'draw' && !activeColor) return;
             const { x, y } = getCanvasCoords(clientX, clientY);
             if (x >= 0 && x < canvas.width && y >= 0 && y < canvas.height) {
                 const pixelKey = `${x},${y}`;
                 if (lastDrawnPixel === pixelKey) return;
                 lastDrawnPixel = pixelKey;
-                
+
                 const radius = Math.floor(brushSize / 2);
                 for (let dx = -radius; dx <= radius; dx++) {
                     for (let dy = -radius; dy <= radius; dy++) {
@@ -540,7 +747,7 @@
                                 ctx.fillStyle = activeColor;
                                 ctx.fillRect(targetX, targetY, 1, 1);
                             } else {
-                                socket.emit('delete_pixel', { x: targetX, y: targetY });
+                                emitWithAuth('delete_pixel', { x: targetX, y: targetY });
                                 ctx.clearRect(targetX, targetY, 1, 1);
                             }
                         }
@@ -579,9 +786,9 @@
                 cursor.style.width = `${brushSize * scale}px`;
                 cursor.style.height = `${brushSize * scale}px`;
                 cursor.style.transform = `translate(${offsetX + visualX * scale}px, ${offsetY + visualY * scale}px)`;
-                cursor.style.borderColor = activeTool === 'draw' ? activeColor : '#ff0000';
+                cursor.style.borderColor = activeTool === 'draw' ? (activeColor || '#ffffff') : '#ff0000';
                 document.getElementById('admin-coords').innerText = `Координаты: [${x}, ${y}] (Размер: ${brushSize})`;
-                
+
                 if (isDrawing) {
                     applyTool(e.clientX, e.clientY);
                 }
@@ -602,14 +809,14 @@
             const delta = e.deltaY > 0 ? -1 : 1;
             const oldScale = scale;
             scale = Math.max(1, Math.min(100, scale + delta));
-            
+
             const rect = container.getBoundingClientRect();
             const mouseX = e.clientX - rect.left;
             const mouseY = e.clientY - rect.top;
 
             offsetX = mouseX - (mouseX - offsetX) * (scale / oldScale);
             offsetY = mouseY - (mouseY - offsetY) * (scale / oldScale);
-            
+
             updateTransform();
         }, { passive: false });
 
@@ -618,51 +825,38 @@
         document.getElementById('btn-admin-zoom-out').addEventListener('click', () => { scale = Math.max(1, scale - 2); updateTransform(); });
         document.getElementById('btn-admin-center').addEventListener('click', window.centerCanvas);
 
-        const palette = document.getElementById('admin-palette');
-        COLORS.forEach(color => {
-            const btn = document.createElement('div');
-            btn.className = 'color-btn';
-            btn.style.backgroundColor = color;
-            if (color === activeColor) btn.classList.add('active');
-            btn.addEventListener('click', () => {
-                document.querySelectorAll('.color-btn').forEach(b => b.classList.remove('active'));
-                btn.classList.add('active');
-                activeColor = color;
-                activeTool = 'draw';
-                updateToolUI();
+        function buildPalette() {
+            const palette = document.getElementById('admin-palette');
+            palette.innerHTML = '';
+            const colors = activeRound ? activeRound.palette : [];
+            if (!activeColor || !colors.includes(activeColor)) activeColor = colors[0] || null;
+            colors.forEach(color => {
+                const btn = document.createElement('div');
+                btn.className = 'color-btn';
+                btn.style.backgroundColor = color;
+                if (color === activeColor) btn.classList.add('active');
+                btn.addEventListener('click', () => {
+                    document.querySelectorAll('#admin-palette .color-btn').forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+                    activeColor = color;
+                    activeTool = 'draw';
+                    updateToolUI();
+                });
+                palette.appendChild(btn);
             });
-            palette.appendChild(btn);
-        });
+        }
 
         document.getElementById('tool-draw').addEventListener('click', () => { activeTool = 'draw'; updateToolUI(); });
         document.getElementById('tool-delete').addEventListener('click', () => { activeTool = 'delete'; updateToolUI(); });
-
-        const customColorPicker = document.getElementById('admin-custom-color');
-        customColorPicker.addEventListener('input', (e) => {
-            activeColor = e.target.value;
-            activeTool = 'draw';
-            document.querySelectorAll('.color-btn').forEach(b => b.classList.remove('active'));
-            updateToolUI();
-        });
 
         function updateToolUI() {
             document.getElementById('tool-draw').classList.toggle('active-tool', activeTool === 'draw');
             document.getElementById('tool-delete').classList.toggle('active-tool', activeTool === 'delete');
         }
 
-        // Rest of the buttons
-        document.getElementById('btn-save-settings').addEventListener('click', () => {
-            emitWithAuth('update_settings', {
-                canvas_size: parseInt(document.getElementById('admin-size').value),
-                cooldown: parseInt(document.getElementById('admin-cooldown').value),
-                grid_enabled: document.getElementById('admin-grid').checked,
-                bg_color: document.getElementById('admin-bg-color').value
-            });
-        });
-
         document.getElementById('btn-nuke').addEventListener('click', () => {
-            if (confirm("ВНИМАНИЕ! Вы точно хотите СТЕРЕТЬ ВСЕ ПИКСЕЛИ навсегава?")) {
-                emitWithAuth('clear_canvas');
+            if (confirm("ВНИМАНИЕ! Вы точно хотите СТЕРЕТЬ ВСЕ ПИКСЕЛИ активного раунда навсегда?")) {
+                emitWithAuth('clear_canvas', {}, (res) => { if (res && !res.success) alert(res.error || 'Ошибка очистки'); });
             }
         });
 
@@ -676,6 +870,8 @@
                     link.href = url;
                     link.download = `pixel-battle-backup-${new Date().toISOString().split('T')[0]}.json`;
                     link.click();
+                } else {
+                    alert(response.error || 'Ошибка экспорта');
                 }
             });
         });
@@ -690,9 +886,9 @@
             reader.addEventListener('load', (event) => {
                 try {
                     const data = JSON.parse(event.target.result);
-                    if (confirm("Все текущие пиксели будут удалены. Продолжить?")) {
+                    if (confirm("Все текущие пиксели активного раунда будут удалены. Продолжить?")) {
                         emitWithAuth('import_database', data, (res) => {
-                            if (res.success) alert("Импорт завершен!");
+                            if (res.success) alert("Импорт завершен!"); else alert(res.error || 'Ошибка импорта');
                         });
                     }
                 } catch(e) { alert("Ошибка файла"); }
