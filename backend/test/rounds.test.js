@@ -151,6 +151,7 @@ test("startRoundTx activates an eligible draft round", async () => {
 
 test("finishRound archives the round without ever deleting pixel data", async () => {
     const client = makeMockClient((sql) => {
+        if (sql.startsWith("SELECT * FROM rounds")) return { rows: [{ id: 7, status: "active" }] };
         if (sql.startsWith("UPDATE rounds")) return { rows: [{ id: 7, status: "finished" }] };
         if (sql.startsWith("INSERT INTO round_archives")) return { rows: [] };
         return { rows: [] };
@@ -160,7 +161,8 @@ test("finishRound archives the round without ever deleting pixel data", async ()
     assert.equal(round.id, 7);
 
     const sqlStatements = client.calls.map(c => c.sql);
-    assert.equal(sqlStatements.length, 2);
+    assert.equal(sqlStatements.length, 3);
+    assert.ok(sqlStatements.some(sql => sql.includes("FOR UPDATE")));
     assert.ok(sqlStatements.some(sql => sql.includes("UPDATE rounds SET status = 'finished'")));
     assert.ok(sqlStatements.some(sql => sql.includes("INSERT INTO round_archives")));
     assert.ok(!sqlStatements.some(sql => /DELETE\s+FROM\s+pixels/i.test(sql)), "finishing a round must never delete pixels");
@@ -169,11 +171,34 @@ test("finishRound archives the round without ever deleting pixel data", async ()
 
 test("finishRound refuses to archive a round that is not active", async () => {
     const client = makeMockClient((sql) => {
-        if (sql.startsWith("UPDATE rounds")) return { rows: [] };
+        if (sql.startsWith("SELECT * FROM rounds")) return { rows: [] };
         return { rows: [] };
     });
     await assert.rejects(
         finishRound(client, { roundId: 7, preview: Buffer.from("png"), pixelCount: 0 }),
         /ROUND_NOT_ACTIVE/
     );
+});
+
+
+test("finishRound locks the active round before building the final archive", async () => {
+    const client = makeMockClient((sql) => {
+        if (sql.startsWith("SELECT * FROM rounds")) return { rows: [{ id: 8, status: "active" }] };
+        if (sql.startsWith("UPDATE rounds")) return { rows: [{ id: 8, status: "finished" }] };
+        if (sql.startsWith("INSERT INTO round_archives")) return { rows: [] };
+        return { rows: [] };
+    });
+
+    const result = await finishRound(client, {
+        roundId: 8,
+        buildArchive: async (round, queryable) => {
+            assert.equal(round.id, 8);
+            assert.equal(queryable, client);
+            assert.equal(client.calls.length, 1, "archive builder runs after the row lock");
+            return { preview: Buffer.from("png"), pixelCount: 3 };
+        }
+    });
+
+    assert.equal(result.status, "finished");
+    assert.match(client.calls[0].sql, /FOR UPDATE/);
 });
