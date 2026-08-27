@@ -18,13 +18,18 @@ const archiver = require('archiver');
 const bcrypt = require('bcryptjs');
 const { loadConfig } = require("./lib/config");
 const {
-    isValidColor,
     isValidCoordinate,
-    normalizeSettings,
-    normalizeImportPayload,
     normalizeRollbackPayload
 } = require("./lib/validation");
 const { withTransaction } = require("./lib/transaction");
+const {
+    isColorInPalette,
+    normalizeRoundInput,
+    assertPixelAllowed,
+    normalizeRoundPixelImport,
+    startRoundTx,
+    finishRound
+} = require("./lib/rounds");
 
 // === ГЛОБАЛЬНЫЕ ОБРАБОТЧИКИ ОШИБОК ===
 process.on('uncaughtException', (err) => {
@@ -38,6 +43,13 @@ process.on('unhandledRejection', (reason, promise) => {
 const config = loadConfig(process.env);
 const app = express();
 const server = http.createServer(app);
+
+// Дефолтная палитра для архивного раунда, создаваемого при миграции
+// старого (до системы раундов) холста, чтобы не потерять его историю.
+const LEGACY_PALETTE = [
+    '#000000', '#1a1c2c', '#5d275d', '#b13e53', '#ef7d57', '#ffcd75', '#a7f070', '#38b764',
+    '#257179', '#29366f', '#3b5dc9', '#41a6f6', '#73eff7', '#f4f4f4', '#94b0c2', '#566c86'
+];
 
 // Доверяем одному reverse proxy только в production.
 app.set("trust proxy", config.isProduction ? 1 : false);
@@ -60,8 +72,8 @@ app.use(helmet({
         useDefaults: true,
         directives: {
             "default-src": ["'self'"],
-            "script-src": ["'self'", (req, res) => `'nonce-${res.locals.nonce}'`, "blob:", "'unsafe-eval'"], 
-            "style-src": ["'self'", "'unsafe-inline'"], 
+            "script-src": ["'self'", (req, res) => `'nonce-${res.locals.nonce}'`, "blob:", "'unsafe-eval'"],
+            "style-src": ["'self'", "'unsafe-inline'"],
             "img-src": ["'self'", "data:", "blob:"],
             "connect-src": ["'self'", "https://pixelbattle.hamaanda.ru", "ws://pixelbattle.hamaanda.ru", "wss://pixelbattle.hamaanda.ru", "https://*.hamaanda.ru", "wss://*.hamaanda.ru"],
             "frame-ancestors": ["'none'"],
@@ -187,32 +199,169 @@ app.use((err, req, res, next) => {
     res.status(403).send('Ошибка безопасности: CSRF-токен невалиден. Пожалуйста, обновите страницу.');
 });
 
-// === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+// === СОСТОЯНИЕ РАУНДОВ ===
+//
+// roundState.active   - раунд со статусом 'active' (рисование разрешено), либо null.
+// roundState.view     - раунд, чей холст сейчас показывается посетителям
+//                        (активный, а если такого нет - последний по времени).
+// roundState.upcoming - ближайший черновик с датой начала в будущем (для статуса
+//                        "скоро начнётся"), актуален только когда нет активного раунда.
+let roundState = { active: null, view: null, upcoming: null };
+const finishingRoundIds = new Set();
+const onlineUserIds = new Map(); // socket.id -> userId, для подсчёта онлайна
+
+function publicRound(row) {
+    if (!row) return null;
+    return {
+        id: row.id,
+        name: row.name,
+        description: row.description,
+        status: row.status,
+        starts_at: row.starts_at,
+        ends_at: row.ends_at,
+        activated_at: row.activated_at,
+        finished_at: row.finished_at,
+        canvas_size: row.canvas_size,
+        cooldown: row.cooldown,
+        bg_color: row.bg_color,
+        grid_enabled: row.grid_enabled,
+        palette: row.palette,
+        pixelsPlaced: row.pixelsPlaced || 0
+    };
+}
+
+function publicUpcoming(row) {
+    if (!row) return null;
+    return { id: row.id, name: row.name, description: row.description, starts_at: row.starts_at };
+}
+
+async function loadRoundState() {
+    const activeRes = await pool.query("SELECT * FROM rounds WHERE status = 'active' LIMIT 1");
+    const active = activeRes.rows[0] || null;
+
+    let view = active;
+    if (!view) {
+        const latestRes = await pool.query(
+            "SELECT * FROM rounds ORDER BY COALESCE(finished_at, activated_at, created_at) DESC LIMIT 1"
+        );
+        view = latestRes.rows[0] || null;
+    }
+
+    let upcoming = null;
+    if (!active) {
+        const upcomingRes = await pool.query(
+            "SELECT id, name, description, starts_at FROM rounds WHERE status = 'draft' ORDER BY starts_at ASC LIMIT 1"
+        );
+        upcoming = upcomingRes.rows[0] || null;
+    }
+
+    if (view) {
+        const countRes = await pool.query("SELECT COUNT(*)::int AS c FROM pixel_history WHERE round_id = $1", [view.id]);
+        view.pixelsPlaced = countRes.rows[0].c;
+        if (active && active.id === view.id) active.pixelsPlaced = view.pixelsPlaced;
+    }
+
+    return { active, view, upcoming };
+}
+
+async function buildPublicInitPayload(extra = {}) {
+    const view = roundState.view;
+    const pixelsRes = view
+        ? await pool.query("SELECT x, y, color, user_id FROM pixels WHERE round_id = $1", [view.id])
+        : { rows: [] };
+    return {
+        pixels: pixelsRes.rows,
+        round: publicRound(view),
+        upcoming: publicUpcoming(roundState.upcoming),
+        onlineCount: onlineUserIds.size,
+        serverTime: Date.now(),
+        ...extra
+    };
+}
+
+function broadcastPresence() {
+    io.emit("presence_update", { online: onlineUserIds.size });
+}
+
+// Рендерит PNG-превью холста раунда через уже подключённый Jimp.
+// Используется и снапшотами, и финализацией раунда, и разовой миграцией.
+async function renderCanvasPreview(queryable, round) {
+    const size = round.canvas_size;
+    const image = new Jimp(size, size, round.bg_color || '#1f2937');
+    const res = await queryable.query("SELECT x, y, color FROM pixels WHERE round_id = $1", [round.id]);
+    res.rows.forEach(p => {
+        try {
+            const hexColor = Jimp.cssColorToHex(p.color);
+            image.setPixelColor(hexColor, p.x, p.y);
+        } catch (e) { /* Игнорируем битые цвета */ }
+    });
+    return image.getBufferAsync(Jimp.MIME_PNG);
+}
+
+// Блокирует активный раунд, собирает его финальный PNG и только затем
+// переводит его в finished. Это делает превью и число пикселей согласованными.
+async function finishAndArchiveRound(roundId) {
+    return withTransaction(pool, (client) => finishRound(client, {
+        roundId,
+        buildArchive: async (lockedRound, queryable) => {
+            const countRes = await queryable.query(
+                "SELECT COUNT(*)::int AS c FROM pixels WHERE round_id = $1",
+                [lockedRound.id]
+            );
+            const preview = await renderCanvasPreview(queryable, lockedRound);
+            return { preview, pixelCount: countRes.rows[0].c };
+        }
+    }));
+}
+
+// Массовая вставка пикселей одним/несколькими запросами (используется
+// импортом БД и восстановлением области при откате).
+async function bulkInsertPixels(client, roundId, pixels) {
+    for (let i = 0; i < pixels.length; i += 1000) {
+        const chunk = pixels.slice(i, i + 1000);
+        const values = chunk.map((p, idx) => {
+            const base = idx * 5;
+            return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`;
+        }).join(", ");
+        const params = [];
+        chunk.forEach(p => params.push(roundId, p.x, p.y, p.color, p.user_id));
+        await client.query(`INSERT INTO pixels (round_id, x, y, color, user_id) VALUES ${values}`, params);
+    }
+}
+
+// === ФОНОВЫЕ ЗАДАЧИ ===
 
 async function takeSnapshot() {
+    const round = roundState.active;
+    if (!round) return;
     try {
-        const size = currentSettings.canvas_size;
-        // Создаем изображение с фоновым цветом
-        const image = new Jimp(size, size, currentSettings.bg_color || '#1f2937');
-
-        // Получаем все пиксели
-        const res = await pool.query("SELECT x, y, color FROM pixels");
-        res.rows.forEach(p => {
-            try {
-                // Преобразуем HEX в числовой формат Jimp и ставим пиксель
-                const hexColor = Jimp.cssColorToHex(p.color);
-                image.setPixelColor(hexColor, p.x, p.y);
-            } catch (e) { /* Игнорируем битые цвета */ }
-        });
-
-        const buffer = await image.getBufferAsync(Jimp.MIME_PNG);
-        await pool.query("INSERT INTO snapshots (data) VALUES ($1)", [buffer]);
-        console.log(`[Snapshot] Снимок холста сохранен (${size}x${size}) через Jimp`);
+        const buffer = await renderCanvasPreview(pool, round);
+        await pool.query("INSERT INTO snapshots (round_id, data) VALUES ($1, $2)", [round.id, buffer]);
+        console.log(`[Snapshot] Раунд #${round.id}: снимок холста сохранён (${round.canvas_size}x${round.canvas_size})`);
     } catch (err) { console.error("Snapshot error:", err); }
 }
 
-// Фоновые задачи
+async function autoFinishExpiredRound() {
+    const round = roundState.active;
+    if (!round || new Date(round.ends_at).getTime() > Date.now() || finishingRoundIds.has(round.id)) return;
+
+    finishingRoundIds.add(round.id);
+    try {
+        const finished = await finishAndArchiveRound(round.id);
+        await logAdminAction("AUTO_FINISH_ROUND", { roundId: finished.id, name: finished.name });
+        roundState = await loadRoundState();
+        io.emit("init_data", await buildPublicInitPayload());
+        io.to("admins").emit("admin_rounds_changed");
+        console.log("[Rounds] Раунд #" + finished.id + " автоматически завершён по истечении времени");
+    } catch (err) {
+        console.error("Auto-finish error:", err);
+    } finally {
+        finishingRoundIds.delete(round.id);
+    }
+}
+
 setInterval(takeSnapshot, 10 * 60 * 1000); // Снимок каждые 10 минут
+setInterval(autoFinishExpiredRound, 15 * 1000); // Проверка окончания активного раунда
 setInterval(async () => {
     try {
         await pool.query("DELETE FROM pixel_history WHERE created_at < NOW() - INTERVAL '48 hours'");
@@ -261,7 +410,7 @@ app.get("/admin/download-timelapse", async (req, res) => {
 
     try {
         const snapshotsRes = await pool.query("SELECT data, created_at FROM snapshots ORDER BY created_at ASC");
-        
+
         if (snapshotsRes.rows.length === 0) {
             return res.status(404).send("No snapshots found");
         }
@@ -309,15 +458,81 @@ app.get("/", (req, res) => {
     let userId = req.signedCookies.uid;
     if (!userId) {
         userId = "u_" + crypto.randomBytes(8).toString("hex");
-        res.cookie("uid", userId, { 
-            signed: true, 
-            maxAge: 365 * 24 * 60 * 60 * 1000, 
+        res.cookie("uid", userId, {
+            signed: true,
+            maxAge: 365 * 24 * 60 * 60 * 1000,
             httpOnly: true,
             sameSite: 'lax',
             secure: config.isProduction
         });
     }
     sendHtmlWithContext(res, path.join(__dirname, "public", "index.html"));
+});
+
+// Публичная страница архива завершённых раундов (список и просмотр одного раунда).
+app.get("/archive", (req, res) => {
+    sendHtmlWithContext(res, path.join(__dirname, "public", "archive.html"));
+});
+app.get("/archive/:id", (req, res) => {
+    sendHtmlWithContext(res, path.join(__dirname, "public", "archive.html"));
+});
+
+// === ПУБЛИЧНОЕ JSON API АРХИВА ===
+
+app.get("/api/rounds/archive", async (req, res) => {
+    try {
+        const result = await pool.query(`
+            SELECT r.id, r.name, r.description, r.starts_at, r.ends_at, r.finished_at, r.canvas_size,
+                   COALESCE(ra.pixel_count, 0) AS pixel_count,
+                   (ra.round_id IS NOT NULL) AS has_preview
+            FROM rounds r
+            LEFT JOIN round_archives ra ON ra.round_id = r.id
+            WHERE r.status = 'finished'
+            ORDER BY r.finished_at DESC NULLS LAST, r.id DESC
+        `);
+        res.json({ rounds: result.rows });
+    } catch (err) {
+        console.error("Archive list error:", err);
+        res.status(500).json({ error: "Server error" });
+    }
+});
+
+app.get("/api/rounds/archive/:id", async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: "Invalid id" });
+    try {
+        const result = await pool.query(`
+            SELECT r.id, r.name, r.description, r.starts_at, r.ends_at, r.finished_at, r.canvas_size,
+                   COALESCE(ra.pixel_count, 0) AS pixel_count,
+                   (ra.round_id IS NOT NULL) AS has_preview
+            FROM rounds r
+            LEFT JOIN round_archives ra ON ra.round_id = r.id
+            WHERE r.id = $1 AND r.status = 'finished'
+        `, [id]);
+        if (result.rows.length === 0) return res.status(404).json({ error: "Not found" });
+        res.json({ round: result.rows[0] });
+    } catch (err) {
+        console.error("Archive detail error:", err);
+        res.status(500).json({ error: "Server error" });
+    }
+});
+
+app.get("/api/rounds/archive/:id/preview.png", async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).send("Invalid id");
+    try {
+        const result = await pool.query(
+            "SELECT ra.preview FROM round_archives ra JOIN rounds r ON r.id = ra.round_id WHERE ra.round_id = $1 AND r.status = 'finished'",
+            [id]
+        );
+        if (result.rows.length === 0) return res.status(404).send("Not found");
+        res.set("Content-Type", "image/png");
+        res.set("Cache-Control", "public, max-age=86400, immutable");
+        res.send(result.rows[0].preview);
+    } catch (err) {
+        console.error("Archive preview error:", err);
+        res.status(500).send("Server error");
+    }
 });
 
 app.use(express.static(path.join(__dirname, "public"), { index: false }));
@@ -352,11 +567,11 @@ io.use((socket, next) => {
     });
 });
 
-let currentSettings = { canvas_size: 50, cooldown: 2, grid_enabled: true, bg_color: "#1f2937" };
 const userCooldowns = new Map();
+const userPlacementsInFlight = new Set();
 const messageRates = new Map();
-const MSG_LIMIT = 100; 
-const MSG_WINDOW_MS = 1000; 
+const MSG_LIMIT = 100;
+const MSG_WINDOW_MS = 1000;
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 io.on("connection", async (socket) => {
@@ -373,67 +588,127 @@ io.on("connection", async (socket) => {
     const userId = socket.userId;
     const isAdmin = socket.isAdmin;
     if (isAdmin) socket.join("admins");
-    
-    socket.on("disconnect", () => messageRates.delete(socket.id));
+
+    onlineUserIds.set(socket.id, userId);
+    broadcastPresence();
+
+    socket.on("disconnect", () => {
+        messageRates.delete(socket.id);
+        onlineUserIds.delete(socket.id);
+        broadcastPresence();
+    });
 
     try {
-        const pixelsRes = await pool.query("SELECT x, y, color, user_id FROM pixels");
-        const initPayload = { 
-            pixels: pixelsRes.rows, 
-            settings: currentSettings, 
-            userId: userId,
+        const payload = await buildPublicInitPayload({
+            userId,
             role: socket.request.user ? socket.request.user.role : 'user'
-        };
+        });
         if (socket.canEditCanvas) {
             const logsRes = await pool.query("SELECT * FROM admin_logs ORDER BY created_at DESC LIMIT 100");
-            initPayload.adminLogs = logsRes.rows;
+            payload.adminLogs = logsRes.rows;
         }
-        socket.emit("init_data", initPayload);
+        socket.emit("init_data", payload);
+
         const lastPlaced = userCooldowns.get(userId) || 0;
-        const cooldownMs = currentSettings.cooldown * 1000;
+        const cooldownMs = (roundState.active ? roundState.active.cooldown : 0) * 1000;
         const remainingCooldownMs = Math.max(0, cooldownMs - (Date.now() - lastPlaced));
         socket.emit("user_status", { remainingCooldownMs });
     } catch (err) { console.error(err); }
 
     socket.on("set_pixel", async (data) => {
+        let placementLocked = false;
         try {
             if (!data) return;
             const { x, y, color } = data;
-            if (
-                !isValidCoordinate(x, currentSettings.canvas_size) ||
-                !isValidCoordinate(y, currentSettings.canvas_size) ||
-                !isValidColor(color)
-            ) return;
+            const round = roundState.active;
+            if (round && finishingRoundIds.has(round.id)) return;
+
+            const allowed = assertPixelAllowed({ activeRound: round, x, y, color });
+            if (!allowed.ok) return;
+
             const now = Date.now();
             const lastPlaced = userCooldowns.get(userId) || 0;
-            const cooldownMs = currentSettings.cooldown * 1000;
-            if (!socket.canEditCanvas && now - lastPlaced < cooldownMs - 100) return;
+            const cooldownMs = round.cooldown * 1000;
+            if (!socket.canEditCanvas && (userPlacementsInFlight.has(userId) || now - lastPlaced < cooldownMs - 100)) return;
+
+            // Не даём двум сообщениям одного пользователя одновременно обойти кулдаун.
+            if (!socket.canEditCanvas) {
+                userPlacementsInFlight.add(userId);
+                placementLocked = true;
+            }
+
+            const placed = await withTransaction(pool, async (client) => {
+                if (finishingRoundIds.has(round.id)) return false;
+
+                // finishRound берёт FOR UPDATE на ту же строку. Значит финальный
+                // снимок ждёт все начатые размещения, а после завершения новые
+                // транзакции уже не увидят active-раунд.
+                const activeCheck = await client.query(
+                    "SELECT id, status, canvas_size, palette FROM rounds WHERE id = $1 AND status = 'active' FOR SHARE",
+                    [round.id]
+                );
+                if (activeCheck.rows.length === 0) return false;
+
+                // Палитра читается из той же заблокированной строки БД, а не
+                // только из in-memory-кэша: изменение палитры нельзя обойти
+                // гонкой между UPDATE rounds и обновлением roundState.
+                const databaseAllowed = assertPixelAllowed({
+                    activeRound: activeCheck.rows[0],
+                    x,
+                    y,
+                    color
+                });
+                if (!databaseAllowed.ok) return false;
+
+                await client.query(
+                    "INSERT INTO pixels (round_id, x, y, color, user_id) VALUES ($1, $2, $3, $4, $5) " +
+                    "ON CONFLICT (round_id, x, y) DO UPDATE SET color = EXCLUDED.color, user_id = EXCLUDED.user_id, updated_at = CURRENT_TIMESTAMP",
+                    [round.id, x, y, color, userId]
+                );
+                await client.query(
+                    "INSERT INTO pixel_history (round_id, x, y, color, user_id) VALUES ($1, $2, $3, $4, $5)",
+                    [round.id, x, y, color, userId]
+                );
+                return true;
+            });
+            if (!placed) return;
+
             if (!socket.canEditCanvas) {
                 userCooldowns.set(userId, now);
-                await pool.query("INSERT INTO users (user_id, last_placed_at) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET last_placed_at = EXCLUDED.last_placed_at", [userId, now]);
+                await pool.query(
+                    "INSERT INTO users (user_id, last_placed_at) VALUES ($1, $2) " +
+                    "ON CONFLICT (user_id) DO UPDATE SET last_placed_at = EXCLUDED.last_placed_at",
+                    [userId, now]
+                );
             }
-            await pool.query(`INSERT INTO pixels (x, y, color, user_id) VALUES ($1, $2, $3, $4) ON CONFLICT (x, y) DO UPDATE SET color = EXCLUDED.color, user_id = EXCLUDED.user_id, updated_at = CURRENT_TIMESTAMP`, [x, y, color, userId]);
-            
-            // Запись в историю для откатов
-            await pool.query(`INSERT INTO pixel_history (x, y, color, user_id) VALUES ($1, $2, $3, $4)`, [x, y, color, userId]);
+
+            round.pixelsPlaced = (round.pixelsPlaced || 0) + 1;
+            if (roundState.view && roundState.view.id === round.id) roundState.view.pixelsPlaced = round.pixelsPlaced;
 
             io.emit("pixel_update", { x, y, color, userId });
+            io.emit("round_stats", { roundId: round.id, pixelsPlaced: round.pixelsPlaced });
             if (socket.canEditCanvas) {
                 await logAdminAction("SET_PIXEL", { user: userId, x, y, color, role: socket.isAdmin ? 'admin' : 'moderator' });
             }
-        } catch (err) { console.error(err); }
+        } catch (err) {
+            console.error(err);
+        } finally {
+            if (placementLocked) userPlacementsInFlight.delete(userId);
+        }
     });
 
     socket.on("delete_pixel", async (payload) => {
         if (!socket.canEditCanvas) return;
+        const round = roundState.active;
+        if (!round) return;
         const data = payload && payload.data ? payload.data : payload;
         const { x, y } = data;
         if (
-            !isValidCoordinate(x, currentSettings.canvas_size) ||
-            !isValidCoordinate(y, currentSettings.canvas_size)
+            !isValidCoordinate(x, round.canvas_size) ||
+            !isValidCoordinate(y, round.canvas_size)
         ) return;
         try {
-            await pool.query("DELETE FROM pixels WHERE x = $1 AND y = $2", [x, y]);
+            await pool.query("DELETE FROM pixels WHERE round_id = $1 AND x = $2 AND y = $3", [round.id, x, y]);
             await logAdminAction("DELETE_PIXEL", { user: userId, x, y, role: socket.isAdmin ? 'admin' : 'moderator' });
             io.emit("pixel_deleted", { x, y });
         } catch (err) { console.error(err); }
@@ -506,67 +781,172 @@ io.on("connection", async (socket) => {
         } catch (err) { if (typeof callback === 'function') callback({ success: false }); }
     });
 
-    socket.on("clear_canvas", async (payload) => {
-        if (!verifyAdminCsrf(socket, payload)) return;
+    socket.on("clear_canvas", async (payload, callback) => {
+        if (!verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
+        const round = roundState.active;
+        if (!round) return callback && callback({ success: false, error: "Нет активного раунда" });
         try {
-            await pool.query("DELETE FROM pixels");
-            await logAdminAction("CLEAR_CANVAS", { user: userId });
+            await pool.query("DELETE FROM pixels WHERE round_id = $1", [round.id]);
+            await logAdminAction("CLEAR_CANVAS", { user: userId, roundId: round.id });
+            round.pixelsPlaced = 0;
             io.emit("canvas_cleared");
-        } catch (err) { console.error(err); }
+            if (typeof callback === 'function') callback({ success: true });
+        } catch (err) { console.error(err); if (typeof callback === 'function') callback({ success: false }); }
     });
 
-    socket.on("update_settings", async (payload) => {
-        if (!verifyAdminCsrf(socket, payload) || !payload.data) return;
-        const validated = normalizeSettings(payload.data, currentSettings);
-        if (!validated) return;
+    // === УПРАВЛЕНИЕ РАУНДАМИ ===
+
+    socket.on("list_rounds", async (payload, callback) => {
+        if (!socket.isAdmin || !verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
         try {
-            await pool.query(`UPDATE settings SET canvas_size = $1, cooldown = $2, grid_enabled = $3, bg_color = $4 WHERE id = 1`, [validated.canvas_size, validated.cooldown, validated.grid_enabled, validated.bg_color]);
-            currentSettings = validated;
-            await logAdminAction("UPDATE_SETTINGS", { user: userId, settings: validated });
-            io.emit("settings_updated", currentSettings);
-        } catch (err) { console.error(err); }
+            const res = await pool.query("SELECT * FROM rounds ORDER BY created_at DESC");
+            if (typeof callback === 'function') callback({ success: true, rounds: res.rows.map(publicRound) });
+        } catch (err) { console.error(err); if (typeof callback === 'function') callback({ success: false }); }
+    });
+
+    socket.on("create_round", async (payload, callback) => {
+        if (!socket.isAdmin || !verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
+        const normalized = normalizeRoundInput(payload.data);
+        if (!normalized.ok) return callback && callback({ success: false, error: normalized.error });
+        const v = normalized.value;
+        try {
+            const res = await pool.query(
+                `INSERT INTO rounds (name, description, status, starts_at, ends_at, canvas_size, cooldown, bg_color, grid_enabled, palette)
+                 VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+                [v.name, v.description, v.starts_at, v.ends_at, v.canvas_size, v.cooldown, v.bg_color, v.grid_enabled, JSON.stringify(v.palette)]
+            );
+            await logAdminAction("CREATE_ROUND", { user: userId, roundId: res.rows[0].id, name: v.name });
+            roundState = await loadRoundState();
+            io.to("admins").emit("admin_rounds_changed");
+            if (roundState.upcoming) io.emit("round_updated", { upcoming: publicUpcoming(roundState.upcoming) });
+            if (typeof callback === 'function') callback({ success: true, round: publicRound(res.rows[0]) });
+        } catch (err) { console.error(err); if (typeof callback === 'function') callback({ success: false, error: "Server error" }); }
+    });
+
+    socket.on("update_round", async (payload, callback) => {
+        if (!socket.isAdmin || !verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
+        const data = (payload && payload.data) || {};
+        const roundId = Number(data.id);
+        if (!Number.isInteger(roundId)) return callback && callback({ success: false, error: "Invalid round id" });
+        try {
+            const existingRes = await pool.query("SELECT * FROM rounds WHERE id = $1", [roundId]);
+            if (existingRes.rows.length === 0) return callback && callback({ success: false, error: "Round not found" });
+            const existing = existingRes.rows[0];
+            if (existing.status === "finished") return callback && callback({ success: false, error: "Раунд уже завершён и не может быть изменён" });
+
+            const isDraft = existing.status === "draft";
+            const merged = {
+                name: data.name !== undefined ? data.name : existing.name,
+                description: data.description !== undefined ? data.description : existing.description,
+                starts_at: (isDraft && data.starts_at !== undefined) ? data.starts_at : existing.starts_at,
+                ends_at: data.ends_at !== undefined ? data.ends_at : existing.ends_at,
+                canvas_size: (isDraft && data.canvas_size !== undefined) ? data.canvas_size : existing.canvas_size,
+                cooldown: data.cooldown !== undefined ? data.cooldown : existing.cooldown,
+                bg_color: data.bg_color !== undefined ? data.bg_color : existing.bg_color,
+                grid_enabled: data.grid_enabled !== undefined ? data.grid_enabled : existing.grid_enabled,
+                palette: data.palette !== undefined ? data.palette : existing.palette
+            };
+
+            const normalized = normalizeRoundInput(merged);
+            if (!normalized.ok) return callback && callback({ success: false, error: normalized.error });
+            const v = normalized.value;
+
+            const res = await pool.query(
+                `UPDATE rounds SET name = $1, description = $2, starts_at = $3, ends_at = $4, canvas_size = $5,
+                    cooldown = $6, bg_color = $7, grid_enabled = $8, palette = $9
+                 WHERE id = $10 RETURNING *`,
+                [v.name, v.description, v.starts_at, v.ends_at, v.canvas_size, v.cooldown, v.bg_color, v.grid_enabled, JSON.stringify(v.palette), roundId]
+            );
+            const updated = res.rows[0];
+
+            await logAdminAction("UPDATE_ROUND", { user: userId, roundId, name: v.name });
+            roundState = await loadRoundState();
+            io.to("admins").emit("admin_rounds_changed");
+
+            if (roundState.active && roundState.active.id === roundId) {
+                io.emit("round_updated", { round: publicRound(roundState.active) });
+            } else if (roundState.upcoming && roundState.upcoming.id === roundId) {
+                io.emit("round_updated", { upcoming: publicUpcoming(roundState.upcoming) });
+            }
+
+            if (typeof callback === 'function') callback({ success: true, round: publicRound(updated) });
+        } catch (err) { console.error(err); if (typeof callback === 'function') callback({ success: false, error: "Server error" }); }
+    });
+
+    socket.on("start_round", async (payload, callback) => {
+        if (!socket.isAdmin || !verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
+        const roundId = Number(payload.data && payload.data.id);
+        if (!Number.isInteger(roundId)) return callback && callback({ success: false, error: "Invalid round id" });
+        try {
+            const started = await withTransaction(pool, (client) => startRoundTx(client, roundId));
+            await logAdminAction("START_ROUND", { user: userId, roundId, name: started.name });
+            roundState = await loadRoundState();
+            io.emit("init_data", await buildPublicInitPayload());
+            io.to("admins").emit("admin_rounds_changed");
+            if (typeof callback === 'function') callback({ success: true, round: publicRound(started) });
+        } catch (err) {
+            const message = err.message === "ANOTHER_ROUND_ACTIVE" ? "Другой раунд уже активен"
+                : err.message === "ROUND_NOT_DRAFT" ? "Раунд не является черновиком"
+                : "Server error";
+            if (typeof callback === 'function') callback({ success: false, error: message });
+        }
+    });
+
+    socket.on("finish_round", async (payload, callback) => {
+        if (!socket.isAdmin || !verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
+        const roundId = Number(payload.data && payload.data.id);
+        if (!Number.isInteger(roundId)) return callback && callback({ success: false, error: "Invalid round id" });
+        if (finishingRoundIds.has(roundId)) {
+            return callback && callback({ success: false, error: "Раунд уже завершается" });
+        }
+
+        finishingRoundIds.add(roundId);
+        try {
+            const finished = await finishAndArchiveRound(roundId);
+            await logAdminAction("FINISH_ROUND", { user: userId, roundId: finished.id, name: finished.name });
+            roundState = await loadRoundState();
+            io.emit("init_data", await buildPublicInitPayload());
+            io.to("admins").emit("admin_rounds_changed");
+            if (typeof callback === 'function') callback({ success: true });
+        } catch (err) {
+            console.error(err);
+            if (typeof callback === 'function') callback({ success: false, error: "Раунд не активен или не удалось создать архив" });
+        } finally {
+            finishingRoundIds.delete(roundId);
+        }
     });
 
     socket.on("export_database", async (payload, callback) => {
         if (!verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
+        const round = roundState.active;
+        if (!round) return callback && callback({ success: false, error: "Нет активного раунда" });
         try {
-            const pixelsRes = await pool.query("SELECT x, y, color, user_id FROM pixels");
-            await logAdminAction("EXPORT_DB", { user: userId });
-            if (typeof callback === 'function') callback({ success: true, pixels: pixelsRes.rows, settings: currentSettings });
+            const pixelsRes = await pool.query("SELECT x, y, color, user_id FROM pixels WHERE round_id = $1", [round.id]);
+            await logAdminAction("EXPORT_DB", { user: userId, roundId: round.id });
+            if (typeof callback === 'function') callback({ success: true, pixels: pixelsRes.rows, round: publicRound(round) });
         } catch (err) { if (typeof callback === 'function') callback({ success: false }); }
     });
 
     socket.on("import_database", async (payload, callback) => {
         if (!verifyAdminCsrf(socket, payload) || !payload.data) return callback && callback({ success: false });
+        const round = roundState.active;
+        if (!round) return callback && callback({ success: false, error: "Нет активного раунда" });
 
-        const normalized = normalizeImportPayload(payload.data, currentSettings);
+        const normalized = normalizeRoundPixelImport(payload.data, round);
         if (!normalized.ok) {
             return callback && callback({ success: false, error: normalized.error });
         }
 
-        const { pixels, settings } = normalized.value;
+        const { pixels } = normalized.value;
         try {
             await withTransaction(pool, async (client) => {
-                await client.query("DELETE FROM pixels");
-
-                for (let i = 0; i < pixels.length; i += 1000) {
-                    const chunk = pixels.slice(i, i + 1000);
-                    const values = chunk.map((p, index) => `(${index * 4 + 1}, ${index * 4 + 2}, ${index * 4 + 3}, ${index * 4 + 4})`).join(", ");
-                    const params = [];
-                    chunk.forEach(p => params.push(p.x, p.y, p.color, p.user_id));
-                    await client.query(`INSERT INTO pixels (x, y, color, user_id) VALUES ${values}`, params);
-                }
-
-                await client.query(
-                    "UPDATE settings SET canvas_size = $1, cooldown = $2, grid_enabled = $3, bg_color = $4 WHERE id = 1",
-                    [settings.canvas_size, settings.cooldown, settings.grid_enabled, settings.bg_color]
-                );
+                await client.query("DELETE FROM pixels WHERE round_id = $1", [round.id]);
+                await bulkInsertPixels(client, round.id, pixels);
             });
 
-            currentSettings = settings;
-            await logAdminAction("IMPORT_DB", { user: userId, pixelCount: pixels.length });
-            const updatedPixels = await pool.query("SELECT x, y, color, user_id FROM pixels");
-            io.emit("init_data", { pixels: updatedPixels.rows, settings: currentSettings });
+            await logAdminAction("IMPORT_DB", { user: userId, roundId: round.id, pixelCount: pixels.length });
+            roundState = await loadRoundState();
+            io.emit("init_data", await buildPublicInitPayload());
             if (typeof callback === "function") callback({ success: true });
         } catch (err) {
             console.error("Import error:", err);
@@ -576,8 +956,10 @@ io.on("connection", async (socket) => {
 
     socket.on("rollback_area", async (payload, callback) => {
         if (!socket.isAdmin || !verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
+        const round = roundState.active;
+        if (!round) return callback && callback({ success: false, error: "Нет активного раунда" });
 
-        const rollback = normalizeRollbackPayload(payload.data, currentSettings.canvas_size);
+        const rollback = normalizeRollbackPayload(payload.data, round.canvas_size);
         if (!rollback) {
             return callback && callback({ success: false, error: "Invalid rollback parameters" });
         }
@@ -588,29 +970,25 @@ io.on("connection", async (socket) => {
                 const res = await client.query(`
                     SELECT DISTINCT ON (x, y) x, y, color, user_id
                     FROM pixel_history
-                    WHERE x >= $1 AND x <= $2 AND y >= $3 AND y <= $4 AND created_at <= $5
+                    WHERE round_id = $1 AND x >= $2 AND x <= $3 AND y >= $4 AND y <= $5 AND created_at <= $6
                     ORDER BY x, y, created_at DESC
-                `, [rollback.x1, rollback.x2, rollback.y1, rollback.y2, targetTime]);
+                `, [round.id, rollback.x1, rollback.x2, rollback.y1, rollback.y2, targetTime]);
 
                 await client.query(
-                    "DELETE FROM pixels WHERE x >= $1 AND x <= $2 AND y >= $3 AND y <= $4",
-                    [rollback.x1, rollback.x2, rollback.y1, rollback.y2]
+                    "DELETE FROM pixels WHERE round_id = $1 AND x >= $2 AND x <= $3 AND y >= $4 AND y <= $5",
+                    [round.id, rollback.x1, rollback.x2, rollback.y1, rollback.y2]
                 );
 
-                for (let i = 0; i < res.rows.length; i += 1000) {
-                    const chunk = res.rows.slice(i, i + 1000);
-                    const values = chunk.map((p, index) => `(${index * 4 + 1}, ${index * 4 + 2}, ${index * 4 + 3}, ${index * 4 + 4})`).join(", ");
-                    const params = [];
-                    chunk.forEach(p => params.push(p.x, p.y, p.color, p.user_id));
-                    await client.query(`INSERT INTO pixels (x, y, color, user_id) VALUES ${values}`, params);
-                }
+                // Восстанавливаем только те цвета, что всё ещё входят в палитру раунда.
+                const restorable = res.rows.filter(p => isColorInPalette(p.color, round.palette));
+                await bulkInsertPixels(client, round.id, restorable);
 
-                return res.rows.length;
+                return restorable.length;
             });
 
-            await logAdminAction("ROLLBACK_AREA", { user: userId, ...rollback });
-            const updatedPixels = await pool.query("SELECT x, y, color, user_id FROM pixels");
-            io.emit("init_data", { pixels: updatedPixels.rows, settings: currentSettings });
+            await logAdminAction("ROLLBACK_AREA", { user: userId, roundId: round.id, ...rollback });
+            roundState = await loadRoundState();
+            io.emit("init_data", await buildPublicInitPayload());
             if (typeof callback === "function") callback({ success: true, count: restoredPixels });
         } catch (err) {
             console.error("Rollback error:", err);
@@ -643,7 +1021,7 @@ async function initDatabase() {
 
     try {
         console.log("Проверка и инициализация таблиц...");
-        
+
         // 1. Сессии
         await client.query(`
             CREATE TABLE IF NOT EXISTS "session" (
@@ -653,7 +1031,7 @@ async function initDatabase() {
             ) WITH (OIDS=FALSE);
         `);
         const pkExists = await client.query(`
-            SELECT 1 FROM information_schema.table_constraints 
+            SELECT 1 FROM information_schema.table_constraints
             WHERE table_name='session' AND constraint_type='PRIMARY KEY'
         `);
         if (pkExists.rowCount === 0) {
@@ -661,48 +1039,79 @@ async function initDatabase() {
         }
         await client.query('CREATE INDEX IF NOT EXISTS "IDX_session_expire" ON "session" ("expire")');
 
-        // 2. Основные таблицы игры
+        // 2. Раунды: холст, кулдаун и палитра, которые определяют игровую сессию.
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS rounds (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(200) NOT NULL,
+                description TEXT,
+                status VARCHAR(20) NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'active', 'finished')),
+                starts_at TIMESTAMP NOT NULL,
+                ends_at TIMESTAMP NOT NULL,
+                canvas_size INT NOT NULL,
+                cooldown INT NOT NULL,
+                bg_color VARCHAR(10) NOT NULL DEFAULT '#1f2937',
+                grid_enabled BOOLEAN NOT NULL DEFAULT true,
+                palette JSONB NOT NULL,
+                activated_at TIMESTAMP,
+                finished_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        // Гарантирует, что активным может быть не более одного раунда одновременно.
+        await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_rounds_single_active ON rounds ((true)) WHERE status = 'active'`);
+
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS round_archives (
+                round_id INTEGER PRIMARY KEY REFERENCES rounds(id) ON DELETE CASCADE,
+                preview BYTEA NOT NULL,
+                pixel_count INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+
+        // 3. Основные таблицы игры
         await client.query(`
             CREATE TABLE IF NOT EXISTS pixels (
-                x INT, 
-                y INT, 
-                color VARCHAR(10) NOT NULL, 
-                user_id VARCHAR(50) NOT NULL, 
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, 
+                x INT,
+                y INT,
+                color VARCHAR(10) NOT NULL,
+                user_id VARCHAR(50) NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (x, y)
             )
         `);
 
         await client.query(`
             CREATE TABLE IF NOT EXISTS settings (
-                id INT PRIMARY KEY, 
-                canvas_size INT NOT NULL, 
-                cooldown INT NOT NULL, 
-                grid_enabled BOOLEAN NOT NULL, 
+                id INT PRIMARY KEY,
+                canvas_size INT NOT NULL,
+                cooldown INT NOT NULL,
+                grid_enabled BOOLEAN NOT NULL,
                 bg_color VARCHAR(10) DEFAULT '#1f2937'
             )
         `);
 
         await client.query(`
             CREATE TABLE IF NOT EXISTS users (
-                user_id VARCHAR(50) PRIMARY KEY, 
+                user_id VARCHAR(50) PRIMARY KEY,
                 last_placed_at BIGINT NOT NULL
             )
         `);
 
         await client.query(`
             CREATE TABLE IF NOT EXISTS moderators (
-                username VARCHAR(50) PRIMARY KEY, 
-                password VARCHAR(100) NOT NULL, 
+                username VARCHAR(50) PRIMARY KEY,
+                password VARCHAR(100) NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         `);
 
         await client.query(`
             CREATE TABLE IF NOT EXISTS admin_logs (
-                id SERIAL PRIMARY KEY, 
-                action VARCHAR(100) NOT NULL, 
-                details JSONB, 
+                id SERIAL PRIMARY KEY,
+                action VARCHAR(100) NOT NULL,
+                details JSONB,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         `);
@@ -716,14 +1125,14 @@ async function initDatabase() {
             }
         }
 
-        // 3. История и Таймлапс
+        // 4. История и Таймлапс
         await client.query(`
             CREATE TABLE IF NOT EXISTS pixel_history (
-                id SERIAL PRIMARY KEY, 
-                x INTEGER NOT NULL, 
-                y INTEGER NOT NULL, 
-                color VARCHAR(50) NOT NULL, 
-                user_id VARCHAR(50) NOT NULL, 
+                id SERIAL PRIMARY KEY,
+                x INTEGER NOT NULL,
+                y INTEGER NOT NULL,
+                color VARCHAR(50) NOT NULL,
+                user_id VARCHAR(50) NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         `);
@@ -732,22 +1141,96 @@ async function initDatabase() {
 
         await client.query(`
             CREATE TABLE IF NOT EXISTS snapshots (
-                id SERIAL PRIMARY KEY, 
-                data BYTEA NOT NULL, 
+                id SERIAL PRIMARY KEY,
+                data BYTEA NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         `);
 
-        // 4. Начальные настройки
+        // 5. Начальные настройки (используются только как источник значений
+        // для архивного "легаси"-раунда при миграции, см. ниже).
         await client.query(`
-            INSERT INTO settings (id, canvas_size, cooldown, grid_enabled, bg_color) 
-            VALUES (1, 50, 2, true, '#1f2937') 
+            INSERT INTO settings (id, canvas_size, cooldown, grid_enabled, bg_color)
+            VALUES (1, 50, 2, true, '#1f2937')
             ON CONFLICT (id) DO NOTHING
         `);
 
-        // Загрузка данных в память
-        const settingsRes = await client.query("SELECT * FROM settings WHERE id = 1");
-        if (settingsRes.rows.length > 0) currentSettings = settingsRes.rows[0];
+        // === МИГРАЦИЯ НА СИСТЕМУ РАУНДОВ ===
+        // Идемпотентно добавляет round_id к существующим таблицам холста/истории/
+        // снимков и, если в БД уже было накоплено состояние без раундов, переносит
+        // его целиком в архивный завершённый раунд - без единого DELETE по данным.
+        await client.query("ALTER TABLE pixels ADD COLUMN IF NOT EXISTS round_id INTEGER REFERENCES rounds(id)");
+        await client.query("ALTER TABLE pixel_history ADD COLUMN IF NOT EXISTS round_id INTEGER REFERENCES rounds(id)");
+        await client.query("ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS round_id INTEGER REFERENCES rounds(id)");
+
+        const orphanPixels = await client.query("SELECT COUNT(*)::int AS c FROM pixels WHERE round_id IS NULL");
+        const orphanHistory = await client.query("SELECT COUNT(*)::int AS c FROM pixel_history WHERE round_id IS NULL");
+        const orphanSnapshots = await client.query("SELECT COUNT(*)::int AS c FROM snapshots WHERE round_id IS NULL");
+
+        if (orphanPixels.rows[0].c > 0 || orphanHistory.rows[0].c > 0 || orphanSnapshots.rows[0].c > 0) {
+            const legacySettingsRes = await client.query("SELECT * FROM settings WHERE id = 1");
+            const legacySettings = legacySettingsRes.rows[0] || { canvas_size: 50, cooldown: 2, grid_enabled: true, bg_color: '#1f2937' };
+
+            const earliestRes = await client.query("SELECT MIN(created_at) AS t FROM pixel_history");
+            const startsAt = earliestRes.rows[0].t || new Date();
+
+            const legacyRoundRes = await client.query(
+                `INSERT INTO rounds (name, description, status, starts_at, ends_at, canvas_size, cooldown, bg_color, grid_enabled, palette, activated_at, finished_at)
+                 VALUES ($1, $2, 'finished', $3, CURRENT_TIMESTAMP, $4, $5, $6, $7, $8, $3, CURRENT_TIMESTAMP)
+                 RETURNING *`,
+                [
+                    "Архив: холст до системы раундов",
+                    "Автоматически создан при миграции на систему раундов, чтобы сохранить прежнее состояние общего холста.",
+                    startsAt,
+                    legacySettings.canvas_size,
+                    legacySettings.cooldown,
+                    legacySettings.bg_color,
+                    legacySettings.grid_enabled,
+                    JSON.stringify(LEGACY_PALETTE)
+                ]
+            );
+            const legacyRound = legacyRoundRes.rows[0];
+
+            await client.query("UPDATE pixels SET round_id = $1 WHERE round_id IS NULL", [legacyRound.id]);
+            await client.query("UPDATE pixel_history SET round_id = $1 WHERE round_id IS NULL", [legacyRound.id]);
+            await client.query("UPDATE snapshots SET round_id = $1 WHERE round_id IS NULL", [legacyRound.id]);
+
+            const previewBuffer = await renderCanvasPreview(client, legacyRound);
+            const pixelCountRes = await client.query("SELECT COUNT(*)::int AS c FROM pixels WHERE round_id = $1", [legacyRound.id]);
+            await client.query(
+                `INSERT INTO round_archives (round_id, preview, pixel_count) VALUES ($1, $2, $3)
+                 ON CONFLICT (round_id) DO NOTHING`,
+                [legacyRound.id, previewBuffer, pixelCountRes.rows[0].c]
+            );
+
+            console.log(`[Migration] Существующий холст и история перенесены в архивный раунд #${legacyRound.id} без потери данных.`);
+        }
+
+        await client.query("ALTER TABLE pixels ALTER COLUMN round_id SET NOT NULL");
+        await client.query("ALTER TABLE pixel_history ALTER COLUMN round_id SET NOT NULL");
+
+        // Переносим первичный ключ pixels на (round_id, x, y): холст становится
+        // независимым для каждого раунда, старые раунды остаются нетронутыми.
+        const pixelsPk = await client.query(`
+            SELECT tc.constraint_name, string_agg(kcu.column_name, ',' ORDER BY kcu.ordinal_position) AS cols
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+                ON tc.constraint_name = kcu.constraint_name AND tc.table_name = kcu.table_name
+            WHERE tc.table_name = 'pixels' AND tc.constraint_type = 'PRIMARY KEY'
+            GROUP BY tc.constraint_name
+        `);
+        const hasCorrectPk = pixelsPk.rows.length > 0 && pixelsPk.rows[0].cols === 'round_id,x,y';
+        if (!hasCorrectPk) {
+            if (pixelsPk.rows.length > 0) {
+                await client.query(`ALTER TABLE pixels DROP CONSTRAINT "${pixelsPk.rows[0].constraint_name}"`);
+            }
+            await client.query('ALTER TABLE pixels ADD CONSTRAINT pixels_pkey PRIMARY KEY (round_id, x, y)');
+        }
+
+        await client.query('CREATE INDEX IF NOT EXISTS idx_pixel_history_round ON pixel_history(round_id)');
+
+        // Загрузка состояния раундов в память
+        roundState = await loadRoundState();
 
         const usersRes = await client.query("SELECT user_id, last_placed_at FROM users");
         usersRes.rows.forEach(u => userCooldowns.set(u.user_id, parseInt(u.last_placed_at)));
