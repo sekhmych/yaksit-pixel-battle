@@ -32,6 +32,24 @@ function isPlainObject(v) {
     return v !== null && typeof v === "object" && !Array.isArray(v);
 }
 
+// Строгая схема v1: неизвестные поля отклоняются, а не молча игнорируются -
+// это не даёт бэкапу незаметно протащить лишние данные (например поле,
+// которое в будущей версии формата получит другой смысл) через валидацию.
+function unknownKey(obj, allowedKeys) {
+    for (const key of Object.keys(obj)) {
+        if (!allowedKeys.includes(key)) return key;
+    }
+    return null;
+}
+
+const TOP_LEVEL_KEYS = ["format", "version", "exported_at", "data"];
+const DATA_KEYS = ["rounds", "pixels", "pixel_history", "snapshots", "round_archives"];
+const ROUND_KEYS = ["id", "name", "description", "status", "starts_at", "ends_at", "canvas_size", "cooldown", "bg_color", "grid_enabled", "palette", "activated_at", "finished_at", "created_at"];
+const PIXEL_KEYS = ["round_id", "x", "y", "color", "user_id", "updated_at"];
+const PIXEL_HISTORY_KEYS = ["id", "round_id", "x", "y", "color", "user_id", "created_at"];
+const SNAPSHOT_KEYS = ["id", "round_id", "data_base64", "created_at"];
+const ROUND_ARCHIVE_KEYS = ["round_id", "preview_base64", "pixel_count", "created_at"];
+
 function isNonEmptyString(v, maxLength) {
     return typeof v === "string" && v.length > 0 && v.length <= maxLength;
 }
@@ -151,6 +169,10 @@ function validateBackup(json, options = {}) {
     if (!isPlainObject(json)) {
         return { ok: false, error: "Бэкап должен быть JSON-объектом." };
     }
+    const unknownTopKey = unknownKey(json, TOP_LEVEL_KEYS);
+    if (unknownTopKey) {
+        return { ok: false, error: `Неизвестное поле верхнего уровня: ${unknownTopKey}.` };
+    }
     if (json.format !== BACKUP_FORMAT) {
         return { ok: false, error: `Неизвестный формат файла (ожидался "${BACKUP_FORMAT}").` };
     }
@@ -162,6 +184,10 @@ function validateBackup(json, options = {}) {
     }
     if (!isPlainObject(json.data)) {
         return { ok: false, error: "Отсутствует или некорректно поле data." };
+    }
+    const unknownDataKey = unknownKey(json.data, DATA_KEYS);
+    if (unknownDataKey) {
+        return { ok: false, error: `Неизвестное поле в data: ${unknownDataKey}.` };
     }
 
     const { rounds, pixels, pixel_history: pixelHistory, snapshots, round_archives: roundArchives } = json.data;
@@ -181,6 +207,8 @@ function validateBackup(json, options = {}) {
 
     for (const r of rounds) {
         if (!isPlainObject(r)) return { ok: false, error: "Некорректная запись в data.rounds." };
+        const unknownRoundKey = unknownKey(r, ROUND_KEYS);
+        if (unknownRoundKey) return { ok: false, error: `Неизвестное поле в записи раунда: ${unknownRoundKey}.` };
         if (!isPositiveInt(r.id)) return { ok: false, error: `Некорректный id раунда: ${JSON.stringify(r.id)}.` };
         if (roundById.has(r.id)) return { ok: false, error: `Повторяющийся id раунда: ${r.id}.` };
         if (!isNonEmptyString(r.name, MAX_NAME_LENGTH)) return { ok: false, error: `Некорректное название раунда #${r.id}.` };
@@ -237,6 +265,8 @@ function validateBackup(json, options = {}) {
     const pixelKeys = new Set();
     for (const p of pixels) {
         if (!isPlainObject(p)) return { ok: false, error: "Некорректная запись в data.pixels." };
+        const unknownPixelKey = unknownKey(p, PIXEL_KEYS);
+        if (unknownPixelKey) return { ok: false, error: `Неизвестное поле в записи пикселя: ${unknownPixelKey}.` };
         const round = roundById.get(p.round_id);
         if (!round) return { ok: false, error: `pixels ссылается на несуществующий round_id ${p.round_id}.` };
         if (!isNonNegativeInt(p.x) || p.x >= round.canvas_size || !isNonNegativeInt(p.y) || p.y >= round.canvas_size) {
@@ -256,6 +286,8 @@ function validateBackup(json, options = {}) {
     const historyIds = new Set();
     for (const h of pixelHistory) {
         if (!isPlainObject(h)) return { ok: false, error: "Некорректная запись в data.pixel_history." };
+        const unknownHistoryKey = unknownKey(h, PIXEL_HISTORY_KEYS);
+        if (unknownHistoryKey) return { ok: false, error: `Неизвестное поле в записи истории: ${unknownHistoryKey}.` };
         if (!isPositiveInt(h.id)) return { ok: false, error: `Некорректный id записи истории: ${JSON.stringify(h.id)}.` };
         if (historyIds.has(h.id)) return { ok: false, error: `Повторяющийся id записи истории: ${h.id}.` };
         const round = roundById.get(h.round_id);
@@ -275,6 +307,8 @@ function validateBackup(json, options = {}) {
     const snapshotIds = new Set();
     for (const s of snapshots) {
         if (!isPlainObject(s)) return { ok: false, error: "Некорректная запись в data.snapshots." };
+        const unknownSnapshotKey = unknownKey(s, SNAPSHOT_KEYS);
+        if (unknownSnapshotKey) return { ok: false, error: `Неизвестное поле в записи снимка: ${unknownSnapshotKey}.` };
         if (!isPositiveInt(s.id)) return { ok: false, error: `Некорректный id снимка: ${JSON.stringify(s.id)}.` };
         if (snapshotIds.has(s.id)) return { ok: false, error: `Повторяющийся id снимка: ${s.id}.` };
         if (s.round_id !== null && !roundById.has(s.round_id)) {
@@ -293,6 +327,8 @@ function validateBackup(json, options = {}) {
     const archiveRoundIds = new Set();
     for (const a of roundArchives) {
         if (!isPlainObject(a)) return { ok: false, error: "Некорректная запись в data.round_archives." };
+        const unknownArchiveKey = unknownKey(a, ROUND_ARCHIVE_KEYS);
+        if (unknownArchiveKey) return { ok: false, error: `Неизвестное поле в записи архива: ${unknownArchiveKey}.` };
         const round = roundById.get(a.round_id);
         if (!round) return { ok: false, error: `round_archives ссылается на несуществующий round_id ${a.round_id}.` };
         if (round.status !== "finished") {

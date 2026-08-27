@@ -185,7 +185,8 @@ async function startTestServer(options = {}) {
         DB_USER, DB_PASSWORD, DB_HOST, DB_PORT: String(DB_PORT), DB_NAME: dbName,
         ADMIN_PASSWORD: "integration-test-admin-password",
         SESSION_SECRET: "integration-test-session-secret-value-0123456789",
-        ROUND_SYNC_INTERVAL_MS: String(options.roundSyncIntervalMs || 300)
+        ROUND_SYNC_INTERVAL_MS: String(options.roundSyncIntervalMs || 300),
+        ...(options.extraEnv || {})
     };
 
     const child = spawn(process.execPath, [path.join(__dirname, "..", "..", "server.js")], { env });

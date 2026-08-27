@@ -2,7 +2,8 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { startTestServer, adminSession, visitorSession, httpRequest } = require("./harness");
+const { startTestServer, adminSession, visitorSession, httpRequest, sleep } = require("./harness");
+const { BACKUP_FORMAT, BACKUP_VERSION } = require("../../lib/backup");
 
 async function seedGameData(server, admin) {
     const now = Date.now();
@@ -254,4 +255,106 @@ test("game backup: restore never touches sessions, moderators or other access da
     // restore did not blow away the caller's own session row.
     const stillLoggedIn = await httpRequest("GET", `${server.baseUrl}/admin`, { headers: { Cookie: admin.cookies } });
     assert.equal(stillLoggedIn.status, 200);
+});
+
+test("game backup: restore waits for an in-flight game operation and leaves no stale write behind", { timeout: 30000 }, async (t) => {
+    // TEST_GAME_OP_DELAY_MS makes every withGameOp()-protected operation pause
+    // for a while right after it has entered the gate (activeGameOps++) but
+    // before it does its actual write - this reliably opens a wide window in
+    // which we can start a concurrent restore and observe whether it waits.
+    const server = await startTestServer({
+        dbPrefix: "pixelbattle_it_backup_race",
+        extraEnv: { TEST_GAME_OP_DELAY_MS: "1500" }
+    });
+    t.after(() => server.stop());
+
+    const admin = await adminSession(server.baseUrl);
+    t.after(() => admin.close());
+
+    const emptyBackup = {
+        format: BACKUP_FORMAT,
+        version: BACKUP_VERSION,
+        exported_at: new Date().toISOString(),
+        data: { rounds: [], pixels: [], pixel_history: [], snapshots: [], round_archives: [] }
+    };
+
+    const order = [];
+    const now = Date.now();
+
+    // Start a game-table write (create_round) that will sit "in flight"
+    // inside withGameOp() for ~1.5s before it actually INSERTs.
+    const createPromise = admin.emit("create_round", {
+        name: "Racy round",
+        starts_at: new Date(now + 3600 * 1000).toISOString(),
+        ends_at: new Date(now + 7200 * 1000).toISOString(),
+        canvas_size: 10,
+        cooldown: 1,
+        bg_color: "#000000",
+        grid_enabled: true,
+        palette: ["#ffffff"]
+    }).then((res) => { order.push("create_round_ack"); return res; });
+
+    // Give create_round time to pass through the socket.use pre-check and
+    // call enterGameOp() (activeGameOps becomes 1), but not enough time to
+    // finish its artificial delay - this is exactly the race window the fix
+    // must close.
+    await sleep(300);
+
+    const restorePromise = httpRequest("POST", `${server.baseUrl}/admin/backup/restore`, {
+        headers: { Cookie: admin.cookies, "X-CSRF-Token": admin.csrfToken },
+        body: emptyBackup
+    }).then((res) => { order.push("restore_response"); return res; });
+
+    const [createResult, restoreResult] = await Promise.all([createPromise, restorePromise]);
+
+    // The in-flight create_round was allowed to actually finish (it started
+    // before maintenanceMode was set, so enterGameOp() let it through)...
+    assert.equal(createResult.success, true, JSON.stringify(createResult));
+    assert.ok(createResult.round && Number.isInteger(createResult.round.id));
+
+    // ...and restore's HTTP response could not have been produced before
+    // that in-flight operation actually completed.
+    assert.deepEqual(order, ["create_round_ack", "restore_response"], "restore must not finish before the in-flight game operation");
+
+    assert.equal(restoreResult.status, 200, restoreResult.body);
+    const restoreBody = JSON.parse(restoreResult.body);
+    assert.equal(restoreBody.success, true);
+    assert.deepEqual(restoreBody.summary, { rounds: 0, pixels: 0, pixelHistory: 0, snapshots: 0, roundArchives: 0 });
+
+    // Proof there is no stale write: because restore waited for the racy
+    // create_round to actually commit before starting its own transaction,
+    // that transaction's "DELETE FROM rounds" saw and removed it. The table
+    // now matches the (empty) backup exactly - not one leftover row from an
+    // operation that "should" have lost the race.
+    const roundsAfter = await server.pool.query("SELECT * FROM rounds");
+    assert.equal(roundsAfter.rows.length, 0, "no stale round survives restore, even though it was in flight when restore started");
+});
+
+test("game backup: export is rejected with 413 (not a partial download) when it would exceed BACKUP_MAX_BYTES", { timeout: 30000 }, async (t) => {
+    // A tiny BACKUP_MAX_BYTES guarantees any non-trivial export exceeds it,
+    // exercising the symmetric size check on the export side.
+    const server = await startTestServer({
+        dbPrefix: "pixelbattle_it_backup_export_limit",
+        extraEnv: { BACKUP_MAX_BYTES: "200" }
+    });
+    t.after(() => server.stop());
+
+    const admin = await adminSession(server.baseUrl);
+    t.after(() => admin.close());
+    await seedGameData(server, admin);
+
+    const exportRes = await httpRequest("GET", `${server.baseUrl}/admin/backup/export`, { headers: { Cookie: admin.cookies } });
+    assert.equal(exportRes.status, 413, exportRes.body);
+    assert.equal(exportRes.headers["content-disposition"], undefined, "a rejected export must never start a file download");
+    const body = JSON.parse(exportRes.body);
+    assert.equal(body.success, false);
+    assert.match(body.error, /BACKUP_MAX_BYTES/, "the error must point admins at the env var that controls the limit");
+
+    // A backup small enough to fit the limit still exports successfully -
+    // the check rejects only when the size is actually exceeded.
+    await server.pool.query("DELETE FROM round_archives; DELETE FROM snapshots; DELETE FROM pixel_history; DELETE FROM pixels; DELETE FROM rounds;");
+    const smallExportRes = await httpRequest("GET", `${server.baseUrl}/admin/backup/export`, { headers: { Cookie: admin.cookies } });
+    assert.equal(smallExportRes.status, 200, smallExportRes.body);
+    assert.match(smallExportRes.headers["content-disposition"], /attachment/);
+    assert.equal(smallExportRes.headers["cache-control"], "no-store, no-cache, must-revalidate, proxy-revalidate");
 });

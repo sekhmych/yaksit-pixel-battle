@@ -218,6 +218,62 @@ test("validateBackup accepts a backup with several rounds, well under the row-co
     assert.equal(validateBackup(backup).ok, true);
 });
 
+test("validateBackup rejects unknown fields at the top level", () => {
+    const backup = validBackup();
+    backup.pg_dump_url = "https://example.com/dump";
+    const result = validateBackup(backup);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /верхнего уровня/);
+});
+
+test("validateBackup rejects unknown fields inside data", () => {
+    const backup = validBackup();
+    backup.data.moderators = [];
+    const result = validateBackup(backup);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /data/);
+});
+
+test("validateBackup rejects unknown fields inside a round record", () => {
+    const backup = validBackup();
+    backup.data.rounds[0].secret_admin_note = "leak";
+    const result = validateBackup(backup);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /раунда/);
+});
+
+test("validateBackup rejects unknown fields inside a pixel record", () => {
+    const backup = validBackup();
+    backup.data.pixels[0].session_token = "leak";
+    const result = validateBackup(backup);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /пикселя/);
+});
+
+test("validateBackup rejects unknown fields inside a pixel_history record", () => {
+    const backup = validBackup();
+    backup.data.pixel_history[0].ip_address = "127.0.0.1";
+    const result = validateBackup(backup);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /истории/);
+});
+
+test("validateBackup rejects unknown fields inside a snapshot record", () => {
+    const backup = validBackup();
+    backup.data.snapshots[0].extra = true;
+    const result = validateBackup(backup);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /снимка/);
+});
+
+test("validateBackup rejects unknown fields inside a round_archives record", () => {
+    const backup = validBackup();
+    backup.data.round_archives[0].password_hash = "leak";
+    const result = validateBackup(backup);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /архива/);
+});
+
 function makeMockClient(queryImpl) {
     const calls = [];
     return {
