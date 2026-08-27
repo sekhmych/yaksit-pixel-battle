@@ -1,16 +1,19 @@
 services:
   app:
-    build: 
+    build:
       context: .
       dockerfile: Dockerfile
+    env_file:
+      - .env
     environment:
-      - DB_HOST=192.168.0.4
-      - DB_PORT=5432
-      - DB_USER=pixel_battle_db_user
-      - DB_PASSWORD=4>pf4ZR&J4Wp6e
-      - DB_NAME=pixel_battle
-      - ADMIN_PASSWORD=adminnesosal85780957
-      - PORT=3000
+      NODE_ENV: production
+      PORT: 3000
     ports:
       - "8888:3000"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

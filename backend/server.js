@@ -15,6 +15,16 @@ const fs = require("fs");
 const Tokens = require('csrf');
 const Jimp = require('jimp');
 const archiver = require('archiver');
+const bcrypt = require('bcryptjs');
+const { loadConfig } = require("./lib/config");
+const {
+    isValidColor,
+    isValidCoordinate,
+    normalizeSettings,
+    normalizeImportPayload,
+    normalizeRollbackPayload
+} = require("./lib/validation");
+const { withTransaction } = require("./lib/transaction");
 
 // === ГЛОБАЛЬНЫЕ ОБРАБОТЧИКИ ОШИБОК ===
 process.on('uncaughtException', (err) => {
@@ -25,14 +35,16 @@ process.on('unhandledRejection', (reason, promise) => {
     console.error('НЕОБРАБОТАННОЕ ОБЕЩАНИЕ (unhandledRejection):', reason);
 });
 
+const config = loadConfig(process.env);
 const app = express();
 const server = http.createServer(app);
 
-// Доверяем прокси (Nginx)
-app.set('trust proxy', 1);
+// Доверяем одному reverse proxy только в production.
+app.set("trust proxy", config.isProduction ? 1 : false);
 
-const SESSION_SECRET = process.env.SESSION_SECRET || "default_secret_dont_use_in_prod";
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin";
+const SESSION_SECRET = config.sessionSecret;
+const ADMIN_PASSWORD = config.adminPassword;
+const BCRYPT_HASH_RE = /^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/;
 
 // === MIDDLEWARE ПОДГОТОВКИ ===
 
@@ -68,15 +80,11 @@ app.use(cookieParser(SESSION_SECRET));
 
 // 4. Подключение к БД
 const pool = new Pool({
-    user: process.env.DB_USER,
-    host: process.env.DB_HOST,
-    database: process.env.DB_NAME,
-    password: process.env.DB_PASSWORD,
-    port: process.env.DB_PORT,
-    connectionTimeoutMillis: 5000, // Тайм-аут 5 сек
+    ...config.database,
+    connectionTimeoutMillis: 5000
 });
 
-console.log(`>>> Параметры БД: host=${process.env.DB_HOST}, user=${process.env.DB_USER}, db=${process.env.DB_NAME} <<<`);
+console.log(`>>> Параметры БД: host=${config.database.host}, user=${config.database.user}, db=${config.database.database} <<<`);
 
 // 5. Сессии
 const sessionMiddleware = session({
@@ -84,23 +92,29 @@ const sessionMiddleware = session({
     secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
-    proxy: true, // Важно для работы за Nginx/Caddy
-    cookie: { 
-        maxAge: 30 * 24 * 60 * 60 * 1000, 
+    proxy: config.isProduction,
+    cookie: {
+        maxAge: 30 * 24 * 60 * 60 * 1000,
         httpOnly: true,
-        sameSite: 'lax',
-        secure: true // Включаем, так как на домене будет HTTPS
+        sameSite: "lax",
+        secure: config.isProduction
     }
 });
 app.use(sessionMiddleware);
 
 // 6. Passport
+function timingSafeEqualStr(a, b) {
+    const ha = crypto.createHash("sha256").update(String(a)).digest();
+    const hb = crypto.createHash("sha256").update(String(b)).digest();
+    return crypto.timingSafeEqual(ha, hb);
+}
+
 passport.use(new LocalStrategy({
-    usernameField: 'username', 
+    usernameField: 'username',
     passwordField: 'password'
 }, async (username, password, done) => {
     // Мастер-админ
-    if (username === 'admin' && password === ADMIN_PASSWORD) {
+    if (username === 'admin' && timingSafeEqualStr(password, ADMIN_PASSWORD)) {
         return done(null, { id: 'admin', role: 'admin' });
     }
     // Модераторы
@@ -108,7 +122,9 @@ passport.use(new LocalStrategy({
         const res = await pool.query("SELECT * FROM moderators WHERE username = $1", [username]);
         if (res.rows.length > 0) {
             const mod = res.rows[0];
-            if (mod.password === password) { // В реальном проекте используйте bcrypt!
+            let match = false;
+            try { match = await bcrypt.compare(password, mod.password); } catch (e) { match = false; }
+            if (match) {
                 return done(null, { id: mod.username, role: 'moderator' });
             }
         }
@@ -116,6 +132,23 @@ passport.use(new LocalStrategy({
 
     return done(null, false, { message: 'Неверный логин или пароль' });
 }));
+
+// Rate-limit брутфорса логина (по IP)
+const loginAttempts = new Map();
+const LOGIN_LIMIT = 10;
+const LOGIN_WINDOW_MS = 5 * 60 * 1000;
+function loginRateLimit(req, res, next) {
+    const key = req.ip;
+    const now = Date.now();
+    const entry = loginAttempts.get(key) || { count: 0, startTime: now };
+    if (now - entry.startTime > LOGIN_WINDOW_MS) { entry.count = 0; entry.startTime = now; }
+    entry.count++;
+    loginAttempts.set(key, entry);
+    if (entry.count > LOGIN_LIMIT) {
+        return res.status(429).send("Слишком много попыток входа. Попробуйте позже.");
+    }
+    next();
+}
 
 passport.serializeUser((user, done) => done(null, JSON.stringify(user)));
 passport.deserializeUser((data, done) => {
@@ -255,7 +288,7 @@ app.get("/admin/login", csrfProtection, (req, res) => {
     sendHtmlWithContext(res, path.join(__dirname, "public", "login.html"), req.csrfToken());
 });
 
-app.post("/admin/login", csrfProtection, passport.authenticate("local", {
+app.post("/admin/login", loginRateLimit, csrfProtection, passport.authenticate("local", {
     successRedirect: "/admin",
     failureRedirect: "/admin/login"
 }));
@@ -281,7 +314,7 @@ app.get("/", (req, res) => {
             maxAge: 365 * 24 * 60 * 60 * 1000, 
             httpOnly: true,
             sameSite: 'lax',
-            secure: process.env.NODE_ENV === 'production'
+            secure: config.isProduction
         });
     }
     sendHtmlWithContext(res, path.join(__dirname, "public", "index.html"));
@@ -291,9 +324,8 @@ app.use(express.static(path.join(__dirname, "public"), { index: false }));
 
 // === SOCKET.IO ===
 
-const allowedOrigins = process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',') : ["*"];
-const io = new Server(server, { 
-    cors: { origin: allowedOrigins, methods: ["GET", "POST"], credentials: true },
+const io = new Server(server, {
+    cors: { origin: config.allowedOrigins, methods: ["GET", "POST"], credentials: true },
     pingTimeout: 30000,
     pingInterval: 10000
 });
@@ -320,7 +352,7 @@ io.use((socket, next) => {
     });
 });
 
-let currentSettings = { canvas_size: 50, cooldown: 2, grid_enabled: true, bg_color: '#1f2937' };
+let currentSettings = { canvas_size: 50, cooldown: 2, grid_enabled: true, bg_color: "#1f2937" };
 const userCooldowns = new Map();
 const messageRates = new Map();
 const MSG_LIMIT = 100; 
@@ -367,8 +399,11 @@ io.on("connection", async (socket) => {
         try {
             if (!data) return;
             const { x, y, color } = data;
-            if (typeof x !== "number" || typeof y !== "number" || typeof color !== "string") return;
-            if (x < 0 || x >= currentSettings.canvas_size || y < 0 || y >= currentSettings.canvas_size) return;
+            if (
+                !isValidCoordinate(x, currentSettings.canvas_size) ||
+                !isValidCoordinate(y, currentSettings.canvas_size) ||
+                !isValidColor(color)
+            ) return;
             const now = Date.now();
             const lastPlaced = userCooldowns.get(userId) || 0;
             const cooldownMs = currentSettings.cooldown * 1000;
@@ -393,7 +428,10 @@ io.on("connection", async (socket) => {
         if (!socket.canEditCanvas) return;
         const data = payload && payload.data ? payload.data : payload;
         const { x, y } = data;
-        if (typeof x !== "number" || typeof y !== "number") return;
+        if (
+            !isValidCoordinate(x, currentSettings.canvas_size) ||
+            !isValidCoordinate(y, currentSettings.canvas_size)
+        ) return;
         try {
             await pool.query("DELETE FROM pixels WHERE x = $1 AND y = $2", [x, y]);
             await logAdminAction("DELETE_PIXEL", { user: userId, x, y, role: socket.isAdmin ? 'admin' : 'moderator' });
@@ -414,9 +452,17 @@ io.on("connection", async (socket) => {
     socket.on("create_moderator", async (payload, callback) => {
         if (!socket.isAdmin || !verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
         const { username, password } = payload.data;
-        if (!username || !password) return callback && callback({ success: false });
+        if (
+            typeof username !== "string" ||
+            username.length < 3 ||
+            username.length > 50 ||
+            typeof password !== "string" ||
+            password.length < 8 ||
+            password.length > 72
+        ) return callback && callback({ success: false, error: "Invalid moderator credentials" });
         try {
-            await pool.query("INSERT INTO moderators (username, password) VALUES ($1, $2)", [username, password]);
+            const hash = await bcrypt.hash(password, 12);
+            await pool.query("INSERT INTO moderators (username, password) VALUES ($1, $2)", [username, hash]);
             await logAdminAction("CREATE_MODERATOR", { admin: userId, moderator: username });
             if (typeof callback === 'function') callback({ success: true });
         } catch (err) { if (typeof callback === 'function') callback({ success: false, error: "Username already exists" }); }
@@ -435,9 +481,17 @@ io.on("connection", async (socket) => {
     socket.on("update_moderator_password", async (payload, callback) => {
         if (!socket.isAdmin || !verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
         const { username, newPassword } = payload.data;
-        if (!username || !newPassword) return callback && callback({ success: false });
+        if (
+            typeof username !== "string" ||
+            username.length < 3 ||
+            username.length > 50 ||
+            typeof newPassword !== "string" ||
+            newPassword.length < 8 ||
+            newPassword.length > 72
+        ) return callback && callback({ success: false, error: "Invalid moderator credentials" });
         try {
-            await pool.query("UPDATE moderators SET password = $1 WHERE username = $2", [newPassword, username]);
+            const hash = await bcrypt.hash(newPassword, 12);
+            await pool.query("UPDATE moderators SET password = $1 WHERE username = $2", [hash, username]);
             await logAdminAction("UPDATE_MOD_PASSWORD", { admin: userId, moderator: username });
             if (typeof callback === 'function') callback({ success: true });
         } catch (err) { if (typeof callback === 'function') callback({ success: false }); }
@@ -463,11 +517,12 @@ io.on("connection", async (socket) => {
 
     socket.on("update_settings", async (payload) => {
         if (!verifyAdminCsrf(socket, payload) || !payload.data) return;
-        const newSettings = payload.data;
+        const validated = normalizeSettings(payload.data, currentSettings);
+        if (!validated) return;
         try {
-            await pool.query(`UPDATE settings SET canvas_size = $1, cooldown = $2, grid_enabled = $3, bg_color = $4 WHERE id = 1`, [newSettings.canvas_size || 50, newSettings.cooldown || 2, newSettings.grid_enabled !== undefined ? newSettings.grid_enabled : true, newSettings.bg_color || '#1f2937']);
-            currentSettings = { ...currentSettings, ...newSettings };
-            await logAdminAction("UPDATE_SETTINGS", { user: userId, settings: newSettings });
+            await pool.query(`UPDATE settings SET canvas_size = $1, cooldown = $2, grid_enabled = $3, bg_color = $4 WHERE id = 1`, [validated.canvas_size, validated.cooldown, validated.grid_enabled, validated.bg_color]);
+            currentSettings = validated;
+            await logAdminAction("UPDATE_SETTINGS", { user: userId, settings: validated });
             io.emit("settings_updated", currentSettings);
         } catch (err) { console.error(err); }
     });
@@ -483,78 +538,83 @@ io.on("connection", async (socket) => {
 
     socket.on("import_database", async (payload, callback) => {
         if (!verifyAdminCsrf(socket, payload) || !payload.data) return callback && callback({ success: false });
-        const data = payload.data;
+
+        const normalized = normalizeImportPayload(payload.data, currentSettings);
+        if (!normalized.ok) {
+            return callback && callback({ success: false, error: normalized.error });
+        }
+
+        const { pixels, settings } = normalized.value;
         try {
-            const { pixels, settings } = data;
-            await pool.query("BEGIN");
-            await pool.query("DELETE FROM pixels");
-            if (pixels && pixels.length > 0) {
+            await withTransaction(pool, async (client) => {
+                await client.query("DELETE FROM pixels");
+
                 for (let i = 0; i < pixels.length; i += 1000) {
                     const chunk = pixels.slice(i, i + 1000);
-                    const values = chunk.map((p, index) => `($${index * 4 + 1}, $${index * 4 + 2}, $${index * 4 + 3}, $${index * 4 + 4})`).join(", ");
+                    const values = chunk.map((p, index) => `(${index * 4 + 1}, ${index * 4 + 2}, ${index * 4 + 3}, ${index * 4 + 4})`).join(", ");
                     const params = [];
-                    chunk.forEach(p => params.push(p.x, p.y, p.color, p.user_id || 'imported'));
-                    await pool.query(`INSERT INTO pixels (x, y, color, user_id) VALUES ${values}`, params);
+                    chunk.forEach(p => params.push(p.x, p.y, p.color, p.user_id));
+                    await client.query(`INSERT INTO pixels (x, y, color, user_id) VALUES ${values}`, params);
                 }
-            }
-            if (settings) {
-                await pool.query(`UPDATE settings SET canvas_size = $1, cooldown = $2, grid_enabled = $3, bg_color = $4 WHERE id = 1`, [settings.canvas_size, settings.cooldown, settings.grid_enabled, settings.bg_color]);
-                currentSettings = { ...currentSettings, ...settings };
-            }
-            await pool.query("COMMIT");
-            await logAdminAction("IMPORT_DB", { user: userId, pixelCount: pixels ? pixels.length : 0 });
+
+                await client.query(
+                    "UPDATE settings SET canvas_size = $1, cooldown = $2, grid_enabled = $3, bg_color = $4 WHERE id = 1",
+                    [settings.canvas_size, settings.cooldown, settings.grid_enabled, settings.bg_color]
+                );
+            });
+
+            currentSettings = settings;
+            await logAdminAction("IMPORT_DB", { user: userId, pixelCount: pixels.length });
             const updatedPixels = await pool.query("SELECT x, y, color, user_id FROM pixels");
             io.emit("init_data", { pixels: updatedPixels.rows, settings: currentSettings });
-            if (typeof callback === 'function') callback({ success: true });
-        } catch (err) { await pool.query("ROLLBACK"); if (typeof callback === 'function') callback({ success: false }); }
+            if (typeof callback === "function") callback({ success: true });
+        } catch (err) {
+            console.error("Import error:", err);
+            if (typeof callback === "function") callback({ success: false });
+        }
     });
 
     socket.on("rollback_area", async (payload, callback) => {
         if (!socket.isAdmin || !verifyAdminCsrf(socket, payload)) return callback && callback({ success: false });
-        const { x1, y1, x2, y2, timeAgoMinutes } = payload.data;
-        if (x1 === undefined || y1 === undefined || x2 === undefined || y2 === undefined || !timeAgoMinutes) {
-            return callback && callback({ success: false, error: "Missing parameters" });
+
+        const rollback = normalizeRollbackPayload(payload.data, currentSettings.canvas_size);
+        if (!rollback) {
+            return callback && callback({ success: false, error: "Invalid rollback parameters" });
         }
 
         try {
-            const targetTime = new Date(Date.now() - timeAgoMinutes * 60 * 1000);
-            
-            // Находим последние состояния пикселей до указанного времени в этой области
-            const res = await pool.query(`
-                SELECT DISTINCT ON (x, y) x, y, color, user_id 
-                FROM pixel_history 
-                WHERE x >= $1 AND x <= $2 AND y >= $3 AND y <= $4 AND created_at <= $5
-                ORDER BY x, y, created_at DESC
-            `, [Math.min(x1, x2), Math.max(x1, x2), Math.min(y1, y2), Math.max(y1, y2), targetTime]);
+            const restoredPixels = await withTransaction(pool, async (client) => {
+                const targetTime = new Date(Date.now() - rollback.timeAgoMinutes * 60 * 1000);
+                const res = await client.query(`
+                    SELECT DISTINCT ON (x, y) x, y, color, user_id
+                    FROM pixel_history
+                    WHERE x >= $1 AND x <= $2 AND y >= $3 AND y <= $4 AND created_at <= $5
+                    ORDER BY x, y, created_at DESC
+                `, [rollback.x1, rollback.x2, rollback.y1, rollback.y2, targetTime]);
 
-            await pool.query("BEGIN");
-            // Сначала очищаем область
-            await pool.query("DELETE FROM pixels WHERE x >= $1 AND x <= $2 AND y >= $3 AND y <= $4", [Math.min(x1, x2), Math.max(x1, x2), Math.min(y1, y2), Math.max(y1, y2)]);
-            
-            // Вставляем старые состояния
-            if (res.rows.length > 0) {
+                await client.query(
+                    "DELETE FROM pixels WHERE x >= $1 AND x <= $2 AND y >= $3 AND y <= $4",
+                    [rollback.x1, rollback.x2, rollback.y1, rollback.y2]
+                );
+
                 for (let i = 0; i < res.rows.length; i += 1000) {
                     const chunk = res.rows.slice(i, i + 1000);
-                    const values = chunk.map((p, idx) => `($${idx * 4 + 1}, $${idx * 4 + 2}, $${idx * 4 + 3}, $${idx * 4 + 4})`).join(", ");
+                    const values = chunk.map((p, index) => `(${index * 4 + 1}, ${index * 4 + 2}, ${index * 4 + 3}, ${index * 4 + 4})`).join(", ");
                     const params = [];
                     chunk.forEach(p => params.push(p.x, p.y, p.color, p.user_id));
-                    await pool.query(`INSERT INTO pixels (x, y, color, user_id) VALUES ${values}`, params);
+                    await client.query(`INSERT INTO pixels (x, y, color, user_id) VALUES ${values}`, params);
                 }
-            }
-            await pool.query("COMMIT");
 
-            await logAdminAction("ROLLBACK_AREA", { user: userId, x1, y1, x2, y2, timeAgoMinutes });
-            
-            // Уведомляем всех об обновлении (проще всего переинициализировать область)
-            // Но для красоты отправим каждому клиенту инфу
+                return res.rows.length;
+            });
+
+            await logAdminAction("ROLLBACK_AREA", { user: userId, ...rollback });
             const updatedPixels = await pool.query("SELECT x, y, color, user_id FROM pixels");
             io.emit("init_data", { pixels: updatedPixels.rows, settings: currentSettings });
-            
-            if (typeof callback === 'function') callback({ success: true, count: res.rows.length });
-        } catch (err) { 
-            await pool.query("ROLLBACK");
-            console.error(err);
-            if (typeof callback === 'function') callback({ success: false }); 
+            if (typeof callback === "function") callback({ success: true, count: restoredPixels });
+        } catch (err) {
+            console.error("Rollback error:", err);
+            if (typeof callback === "function") callback({ success: false });
         }
     });
 });
@@ -647,6 +707,15 @@ async function initDatabase() {
             )
         `);
 
+        // Одноразовая совместимая миграция старых plaintext-паролей модераторов.
+        const moderatorsRes = await client.query("SELECT username, password FROM moderators");
+        for (const moderator of moderatorsRes.rows) {
+            if (!BCRYPT_HASH_RE.test(moderator.password)) {
+                const hash = await bcrypt.hash(moderator.password, 12);
+                await client.query("UPDATE moderators SET password = $1 WHERE username = $2", [hash, moderator.username]);
+            }
+        }
+
         // 3. История и Таймлапс
         await client.query(`
             CREATE TABLE IF NOT EXISTS pixel_history (
@@ -694,8 +763,7 @@ async function initDatabase() {
 
 async function startServer() {
     await initDatabase();
-    // По умолчанию 8080 для Amvera/PaaS
-    const PORT = process.env.PORT || 8080;
+    const PORT = config.port;
     server.listen(PORT, "0.0.0.0", () => {
         console.log(`>>> Сервер запущен! <<<`);
         console.log(`>>> Слушает на: 0.0.0.0:${PORT} <<<`);

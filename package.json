@@ -1,5 +1,25 @@
 {
-  "dependencies": {
-    "csurf": "^1.11.0"
+  "name": "yaksit-pixel-battle",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "build:css": "tailwindcss -i ./html/src/input.css -o ./html/tailwind.css --minify",
+    "test": "npm --prefix backend test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/resotuqu/yaksit-pixel-battle.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/resotuqu/yaksit-pixel-battle/issues"
+  },
+  "homepage": "https://github.com/resotuqu/yaksit-pixel-battle#readme",
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.3.3",
+    "tailwindcss": "^4.3.3"
   }
 }
