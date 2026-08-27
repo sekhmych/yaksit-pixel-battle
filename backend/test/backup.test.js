@@ -160,6 +160,85 @@ test("validateBackup rejects an invalid round palette", () => {
     assert.equal(validateBackup(backup).ok, false);
 });
 
+// Restore never must produce a round that the ordinary create/update API
+// (normalizeRoundInput in rounds.js) would refuse to create - in particular,
+// an unbounded canvas_size could make the PNG renderer allocate an enormous
+// amount of memory. These bounds are imported straight from rounds.js so
+// there is a single source of truth, not two copies that can drift apart.
+test("validateBackup rejects a round with canvas_size below the minimum", () => {
+    const backup = validBackup({
+        data: {
+            rounds: [baseRound({ canvas_size: 9 })],
+            pixels: [], pixel_history: [], snapshots: [], round_archives: []
+        }
+    });
+    const result = validateBackup(backup);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /холста/);
+});
+
+test("validateBackup rejects a round with canvas_size above the maximum", () => {
+    const backup = validBackup({
+        data: {
+            rounds: [baseRound({ canvas_size: 1001 })],
+            pixels: [], pixel_history: [], snapshots: [], round_archives: []
+        }
+    });
+    const result = validateBackup(backup);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /холста/);
+});
+
+test("validateBackup rejects a round with cooldown above the maximum", () => {
+    const backup = validBackup({
+        data: {
+            rounds: [baseRound({ cooldown: 3601 })],
+            pixels: [], pixel_history: [], snapshots: [], round_archives: []
+        }
+    });
+    const result = validateBackup(backup);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /кулдаун/);
+});
+
+test("validateBackup rejects a round whose ends_at is not strictly after starts_at", () => {
+    const sameInstant = validBackup({
+        data: {
+            rounds: [baseRound({ starts_at: "2026-01-01T00:00:00.000Z", ends_at: "2026-01-01T00:00:00.000Z" })],
+            pixels: [], pixel_history: [], snapshots: [], round_archives: []
+        }
+    });
+    assert.equal(validateBackup(sameInstant).ok, false);
+
+    const reversed = validBackup({
+        data: {
+            rounds: [baseRound({ starts_at: "2026-01-02T00:00:00.000Z", ends_at: "2026-01-01T00:00:00.000Z" })],
+            pixels: [], pixel_history: [], snapshots: [], round_archives: []
+        }
+    });
+    const result = validateBackup(reversed);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /ends_at/);
+});
+
+test("validateBackup accepts canvas_size and cooldown exactly at the boundary values", () => {
+    const atMin = validBackup({
+        data: {
+            rounds: [baseRound({ canvas_size: 10, cooldown: 0 })],
+            pixels: [], pixel_history: [], snapshots: [], round_archives: []
+        }
+    });
+    assert.equal(validateBackup(atMin).ok, true);
+
+    const atMax = validBackup({
+        data: {
+            rounds: [baseRound({ canvas_size: 1000, cooldown: 3600 })],
+            pixels: [], pixel_history: [], snapshots: [], round_archives: []
+        }
+    });
+    assert.equal(validateBackup(atMax).ok, true);
+});
+
 test("validateBackup rejects pixel_history with a non-existent round_id", () => {
     const backup = validBackup();
     backup.data.pixel_history[0].round_id = 42;
@@ -364,7 +443,7 @@ test("serializeBackup round-trips binary fields exactly through validateBackup",
         rounds: [{
             id: 1, name: "R", description: "d", status: "finished",
             starts_at: new Date("2026-01-01T00:00:00Z"), ends_at: new Date("2026-01-02T00:00:00Z"),
-            canvas_size: 5, cooldown: 1, bg_color: "#000000", grid_enabled: false, palette: ["#abcdef"],
+            canvas_size: 10, cooldown: 1, bg_color: "#000000", grid_enabled: false, palette: ["#abcdef"],
             activated_at: new Date("2026-01-01T00:00:00Z"), finished_at: new Date("2026-01-02T00:00:00Z"),
             created_at: new Date("2025-12-31T00:00:00Z")
         }],

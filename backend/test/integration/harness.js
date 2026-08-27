@@ -291,13 +291,16 @@ async function visitorSession(baseUrl) {
 
     const socket = io(baseUrl, { extraHeaders: { Cookie: uidCookie }, transports: ["websocket"] });
     // См. комментарий в adminSession: ждём init_data, а не голый 'connect'.
-    await new Promise((resolve, reject) => {
+    // Сохраняем сам payload - тестам гонки нужно проверить, что состояние,
+    // которое видит только что подключившийся клиент, реально совпадает с
+    // тем, что восстановил backup.
+    const initData = await new Promise((resolve, reject) => {
         socket.once("init_data", resolve);
         socket.once("connect_error", reject);
         setTimeout(() => reject(new Error("visitor socket did not receive init_data in time")), 8000);
     });
 
-    return { socket, cookie: uidCookie, close: () => socket.close() };
+    return { socket, cookie: uidCookie, initData, close: () => socket.close() };
 }
 
 module.exports = {

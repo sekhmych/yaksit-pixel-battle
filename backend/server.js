@@ -261,6 +261,17 @@ let gameOpsDrainWaiters = [];
 // себя как раньше.
 const TEST_GAME_OP_DELAY_MS = Number(process.env.TEST_GAME_OP_DELAY_MS) || 0;
 
+// Только для интеграционных тестов: задержка, вставляемая ровно между
+// коммитом записи в БД и последующей перезагрузкой roundState/рассылкой
+// событий внутри одной и той же игровой операции. Нужна, чтобы доказать,
+// что restore ждёт не только сам SQL-запрос, а весь жизненный цикл
+// операции - включая actualization/рассылку игрового состояния. В
+// production переменная не задаётся, поэтому задержки нет.
+const TEST_GAME_OP_POST_DB_DELAY_MS = Number(process.env.TEST_GAME_OP_POST_DB_DELAY_MS) || 0;
+async function testPostDbDelay() {
+    if (TEST_GAME_OP_POST_DB_DELAY_MS > 0) await sleep(TEST_GAME_OP_POST_DB_DELAY_MS);
+}
+
 const MAINTENANCE_BLOCKED_EVENTS = new Set([
     "set_pixel", "delete_pixel", "clear_canvas",
     "create_round", "update_round", "start_round", "finish_round", "delete_round",
@@ -406,8 +417,17 @@ async function renderCanvasPreview(queryable, round) {
 
 // Блокирует активный раунд, собирает его финальный PNG и только затем
 // переводит его в finished. Это делает превью и число пикселей согласованными.
+//
+// Не оборачивает сама себя в withGameOp() - её вызывают и ручной finish_round,
+// и автозавершение по расписанию, а каждый из них должен держать gate
+// открытым не только на время этого SQL, но и до своей последующей
+// перезагрузки roundState и рассылки событий (иначе operation считалась бы
+// завершённой раньше, чем реально разослано новое состояние). Поэтому
+// withGameOp() вызывается один раз в самих вызывающих функциях, а не здесь -
+// это исключает как вложенный (двойной) вход в gate, так и окно между
+// коммитом транзакции и рассылкой.
 async function finishAndArchiveRound(roundId) {
-    return withGameOp(() => withTransaction(pool, (client) => finishRound(client, {
+    return withTransaction(pool, (client) => finishRound(client, {
         roundId,
         buildArchive: async (lockedRound, queryable) => {
             const countRes = await queryable.query(
@@ -417,7 +437,7 @@ async function finishAndArchiveRound(roundId) {
             const preview = await renderCanvasPreview(queryable, lockedRound);
             return { preview, pixelCount: countRes.rows[0].c };
         }
-    })));
+    }));
 }
 
 // Массовая вставка пикселей одним/несколькими запросами (используется
@@ -465,11 +485,18 @@ async function autoFinishExpiredRound() {
 
     finishingRoundIds.add(round.id);
     try {
-        const finished = await finishAndArchiveRound(round.id);
+        // Gate остаётся открытым для этой операции вплоть до перезагрузки
+        // roundState и рассылки init_data - только тогда restore может быть
+        // уверен, что больше никто не разошлёт устаревшее игровое состояние.
+        const finished = await withGameOp(async () => {
+            const f = await finishAndArchiveRound(round.id);
+            await testPostDbDelay();
+            roundState = await loadRoundState();
+            io.emit("init_data", await buildPublicInitPayload());
+            io.to("admins").emit("admin_rounds_changed");
+            return f;
+        });
         await logAdminAction("AUTO_FINISH_ROUND", { roundId: finished.id, name: finished.name });
-        roundState = await loadRoundState();
-        io.emit("init_data", await buildPublicInitPayload());
-        io.to("admins").emit("admin_rounds_changed");
         console.log("[Rounds] Раунд #" + finished.id + " автоматически завершён по истечении времени");
         return true;
     } catch (err) {
@@ -485,12 +512,17 @@ async function autoStartEligibleDraft() {
     // перечитываем актуальное значение, а не полагаемся на устаревший кэш.
     if (roundState.active) return false;
     try {
-        const started = await withGameOp(() => withTransaction(pool, (client) => autoStartEligibleDraftTx(client)));
+        const started = await withGameOp(async () => {
+            const s = await withTransaction(pool, (client) => autoStartEligibleDraftTx(client));
+            if (!s) return null;
+            await testPostDbDelay();
+            roundState = await loadRoundState();
+            io.emit("init_data", await buildPublicInitPayload());
+            io.to("admins").emit("admin_rounds_changed");
+            return s;
+        });
         if (!started) return false;
         await logAdminAction("AUTO_START_ROUND", { roundId: started.id, name: started.name });
-        roundState = await loadRoundState();
-        io.emit("init_data", await buildPublicInitPayload());
-        io.to("admins").emit("admin_rounds_changed");
         console.log("[Rounds] Раунд #" + started.id + " автоматически запущен по расписанию");
         return true;
     } catch (err) {
@@ -927,56 +959,68 @@ io.on("connection", async (socket) => {
                 placementLocked = true;
             }
 
-            const placed = await withGameOp(() => withTransaction(pool, async (client) => {
-                if (finishingRoundIds.has(round.id)) return false;
+            // Gate охватывает не только запись в БД, но и последующую
+            // актуализацию in-memory round.pixelsPlaced/roundState.view и
+            // рассылку pixel_update/round_stats - иначе restore могло бы
+            // посчитать операцию завершённой сразу после COMMIT, разослать
+            // свой init_data, а следом полетел бы устаревший pixel_update от
+            // этой же операции.
+            const result = await withGameOp(async () => {
+                const placed = await withTransaction(pool, async (client) => {
+                    if (finishingRoundIds.has(round.id)) return false;
 
-                // finishRound берёт FOR UPDATE на ту же строку. Значит финальный
-                // снимок ждёт все начатые размещения, а после завершения новые
-                // транзакции уже не увидят active-раунд.
-                const activeCheck = await client.query(
-                    "SELECT id, status, canvas_size, palette FROM rounds WHERE id = $1 AND status = 'active' FOR SHARE",
-                    [round.id]
-                );
-                if (activeCheck.rows.length === 0) return false;
+                    // finishRound берёт FOR UPDATE на ту же строку. Значит финальный
+                    // снимок ждёт все начатые размещения, а после завершения новые
+                    // транзакции уже не увидят active-раунд.
+                    const activeCheck = await client.query(
+                        "SELECT id, status, canvas_size, palette FROM rounds WHERE id = $1 AND status = 'active' FOR SHARE",
+                        [round.id]
+                    );
+                    if (activeCheck.rows.length === 0) return false;
 
-                // Палитра читается из той же заблокированной строки БД, а не
-                // только из in-memory-кэша: изменение палитры нельзя обойти
-                // гонкой между UPDATE rounds и обновлением roundState.
-                const databaseAllowed = assertPixelAllowed({
-                    activeRound: activeCheck.rows[0],
-                    x,
-                    y,
-                    color
+                    // Палитра читается из той же заблокированной строки БД, а не
+                    // только из in-memory-кэша: изменение палитры нельзя обойти
+                    // гонкой между UPDATE rounds и обновлением roundState.
+                    const databaseAllowed = assertPixelAllowed({
+                        activeRound: activeCheck.rows[0],
+                        x,
+                        y,
+                        color
+                    });
+                    if (!databaseAllowed.ok) return false;
+
+                    await client.query(
+                        "INSERT INTO pixels (round_id, x, y, color, user_id) VALUES ($1, $2, $3, $4, $5) " +
+                        "ON CONFLICT (round_id, x, y) DO UPDATE SET color = EXCLUDED.color, user_id = EXCLUDED.user_id, updated_at = CURRENT_TIMESTAMP",
+                        [round.id, x, y, color, userId]
+                    );
+                    await client.query(
+                        "INSERT INTO pixel_history (round_id, x, y, color, user_id) VALUES ($1, $2, $3, $4, $5)",
+                        [round.id, x, y, color, userId]
+                    );
+                    return true;
                 });
-                if (!databaseAllowed.ok) return false;
+                if (!placed) return { placed: false };
+                await testPostDbDelay();
 
-                await client.query(
-                    "INSERT INTO pixels (round_id, x, y, color, user_id) VALUES ($1, $2, $3, $4, $5) " +
-                    "ON CONFLICT (round_id, x, y) DO UPDATE SET color = EXCLUDED.color, user_id = EXCLUDED.user_id, updated_at = CURRENT_TIMESTAMP",
-                    [round.id, x, y, color, userId]
-                );
-                await client.query(
-                    "INSERT INTO pixel_history (round_id, x, y, color, user_id) VALUES ($1, $2, $3, $4, $5)",
-                    [round.id, x, y, color, userId]
-                );
-                return true;
-            }));
-            if (!placed) return;
+                if (!socket.canEditCanvas) {
+                    userCooldowns.set(userId, now);
+                    await pool.query(
+                        "INSERT INTO users (user_id, last_placed_at) VALUES ($1, $2) " +
+                        "ON CONFLICT (user_id) DO UPDATE SET last_placed_at = EXCLUDED.last_placed_at",
+                        [userId, now]
+                    );
+                }
 
-            if (!socket.canEditCanvas) {
-                userCooldowns.set(userId, now);
-                await pool.query(
-                    "INSERT INTO users (user_id, last_placed_at) VALUES ($1, $2) " +
-                    "ON CONFLICT (user_id) DO UPDATE SET last_placed_at = EXCLUDED.last_placed_at",
-                    [userId, now]
-                );
-            }
+                round.pixelsPlaced = (round.pixelsPlaced || 0) + 1;
+                if (roundState.view && roundState.view.id === round.id) roundState.view.pixelsPlaced = round.pixelsPlaced;
 
-            round.pixelsPlaced = (round.pixelsPlaced || 0) + 1;
-            if (roundState.view && roundState.view.id === round.id) roundState.view.pixelsPlaced = round.pixelsPlaced;
+                io.emit("pixel_update", { x, y, color, userId });
+                io.emit("round_stats", { roundId: round.id, pixelsPlaced: round.pixelsPlaced });
+                return { placed: true };
+            });
+            if (!result.placed) return;
 
-            io.emit("pixel_update", { x, y, color, userId });
-            io.emit("round_stats", { roundId: round.id, pixelsPlaced: round.pixelsPlaced });
             if (socket.canEditCanvas) {
                 await logAdminAction("SET_PIXEL", { user: userId, x, y, color, role: socket.isAdmin ? 'admin' : 'moderator' });
             }
@@ -998,9 +1042,12 @@ io.on("connection", async (socket) => {
             !isValidCoordinate(y, round.canvas_size)
         ) return;
         try {
-            await withGameOp(() => pool.query("DELETE FROM pixels WHERE round_id = $1 AND x = $2 AND y = $3", [round.id, x, y]));
+            await withGameOp(async () => {
+                await pool.query("DELETE FROM pixels WHERE round_id = $1 AND x = $2 AND y = $3", [round.id, x, y]);
+                await testPostDbDelay();
+                io.emit("pixel_deleted", { x, y });
+            });
             await logAdminAction("DELETE_PIXEL", { user: userId, x, y, role: socket.isAdmin ? 'admin' : 'moderator' });
-            io.emit("pixel_deleted", { x, y });
         } catch (err) { if (!isMaintenanceError(err)) console.error(err); }
     });
 
@@ -1079,10 +1126,13 @@ io.on("connection", async (socket) => {
         const round = roundState.active;
         if (!round) return callback && callback({ success: false, error: "Нет активного раунда" });
         try {
-            await withGameOp(() => pool.query("DELETE FROM pixels WHERE round_id = $1", [round.id]));
+            await withGameOp(async () => {
+                await pool.query("DELETE FROM pixels WHERE round_id = $1", [round.id]);
+                await testPostDbDelay();
+                round.pixelsPlaced = 0;
+                io.emit("canvas_cleared");
+            });
             await logAdminAction("CLEAR_CANVAS", { user: userId, roundId: round.id });
-            round.pixelsPlaced = 0;
-            io.emit("canvas_cleared");
             if (typeof callback === 'function') callback({ success: true });
         } catch (err) {
             if (!isMaintenanceError(err)) console.error(err);
@@ -1106,16 +1156,20 @@ io.on("connection", async (socket) => {
         if (!normalized.ok) return callback && callback({ success: false, error: normalized.error });
         const v = normalized.value;
         try {
-            const res = await withGameOp(() => pool.query(
-                `INSERT INTO rounds (name, description, status, starts_at, ends_at, canvas_size, cooldown, bg_color, grid_enabled, palette)
-                 VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-                [v.name, v.description, v.starts_at, v.ends_at, v.canvas_size, v.cooldown, v.bg_color, v.grid_enabled, JSON.stringify(v.palette)]
-            ));
-            await logAdminAction("CREATE_ROUND", { user: userId, roundId: res.rows[0].id, name: v.name });
-            roundState = await loadRoundState();
-            io.to("admins").emit("admin_rounds_changed");
-            if (roundState.upcoming) io.emit("round_updated", { upcoming: publicUpcoming(roundState.upcoming) });
-            if (typeof callback === 'function') callback({ success: true, round: publicRound(res.rows[0]) });
+            const row = await withGameOp(async () => {
+                const res = await pool.query(
+                    `INSERT INTO rounds (name, description, status, starts_at, ends_at, canvas_size, cooldown, bg_color, grid_enabled, palette)
+                     VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+                    [v.name, v.description, v.starts_at, v.ends_at, v.canvas_size, v.cooldown, v.bg_color, v.grid_enabled, JSON.stringify(v.palette)]
+                );
+                await testPostDbDelay();
+                roundState = await loadRoundState();
+                io.to("admins").emit("admin_rounds_changed");
+                if (roundState.upcoming) io.emit("round_updated", { upcoming: publicUpcoming(roundState.upcoming) });
+                return res.rows[0];
+            });
+            await logAdminAction("CREATE_ROUND", { user: userId, roundId: row.id, name: v.name });
+            if (typeof callback === 'function') callback({ success: true, round: publicRound(row) });
         } catch (err) {
             if (!isMaintenanceError(err)) console.error(err);
             if (typeof callback === 'function') callback({ success: false, error: isMaintenanceError(err) ? "Идёт восстановление игровых данных, подождите и попробуйте снова." : "Server error" });
@@ -1150,24 +1204,26 @@ io.on("connection", async (socket) => {
             if (!normalized.ok) return callback && callback({ success: false, error: normalized.error });
             const v = normalized.value;
 
-            const res = await withGameOp(() => pool.query(
-                `UPDATE rounds SET name = $1, description = $2, starts_at = $3, ends_at = $4, canvas_size = $5,
-                    cooldown = $6, bg_color = $7, grid_enabled = $8, palette = $9
-                 WHERE id = $10 RETURNING *`,
-                [v.name, v.description, v.starts_at, v.ends_at, v.canvas_size, v.cooldown, v.bg_color, v.grid_enabled, JSON.stringify(v.palette), roundId]
-            ));
-            const updated = res.rows[0];
+            const updated = await withGameOp(async () => {
+                const res = await pool.query(
+                    `UPDATE rounds SET name = $1, description = $2, starts_at = $3, ends_at = $4, canvas_size = $5,
+                        cooldown = $6, bg_color = $7, grid_enabled = $8, palette = $9
+                     WHERE id = $10 RETURNING *`,
+                    [v.name, v.description, v.starts_at, v.ends_at, v.canvas_size, v.cooldown, v.bg_color, v.grid_enabled, JSON.stringify(v.palette), roundId]
+                );
+                await testPostDbDelay();
+                roundState = await loadRoundState();
+                io.to("admins").emit("admin_rounds_changed");
+
+                if (roundState.active && roundState.active.id === roundId) {
+                    io.emit("round_updated", { round: publicRound(roundState.active) });
+                } else if (roundState.upcoming && roundState.upcoming.id === roundId) {
+                    io.emit("round_updated", { upcoming: publicUpcoming(roundState.upcoming) });
+                }
+                return res.rows[0];
+            });
 
             await logAdminAction("UPDATE_ROUND", { user: userId, roundId, name: v.name });
-            roundState = await loadRoundState();
-            io.to("admins").emit("admin_rounds_changed");
-
-            if (roundState.active && roundState.active.id === roundId) {
-                io.emit("round_updated", { round: publicRound(roundState.active) });
-            } else if (roundState.upcoming && roundState.upcoming.id === roundId) {
-                io.emit("round_updated", { upcoming: publicUpcoming(roundState.upcoming) });
-            }
-
             if (typeof callback === 'function') callback({ success: true, round: publicRound(updated) });
         } catch (err) {
             if (!isMaintenanceError(err)) console.error(err);
@@ -1180,11 +1236,15 @@ io.on("connection", async (socket) => {
         const roundId = Number(payload.data && payload.data.id);
         if (!Number.isInteger(roundId)) return callback && callback({ success: false, error: "Invalid round id" });
         try {
-            const started = await withGameOp(() => withTransaction(pool, (client) => startRoundTx(client, roundId)));
+            const started = await withGameOp(async () => {
+                const s = await withTransaction(pool, (client) => startRoundTx(client, roundId));
+                await testPostDbDelay();
+                roundState = await loadRoundState();
+                io.emit("init_data", await buildPublicInitPayload());
+                io.to("admins").emit("admin_rounds_changed");
+                return s;
+            });
             await logAdminAction("START_ROUND", { user: userId, roundId, name: started.name });
-            roundState = await loadRoundState();
-            io.emit("init_data", await buildPublicInitPayload());
-            io.to("admins").emit("admin_rounds_changed");
             if (typeof callback === 'function') callback({ success: true, round: publicRound(started) });
         } catch (err) {
             const message = err.message === "ANOTHER_ROUND_ACTIVE" ? "Другой раунд уже активен"
@@ -1205,11 +1265,15 @@ io.on("connection", async (socket) => {
 
         finishingRoundIds.add(roundId);
         try {
-            const finished = await finishAndArchiveRound(roundId);
+            const finished = await withGameOp(async () => {
+                const f = await finishAndArchiveRound(roundId);
+                await testPostDbDelay();
+                roundState = await loadRoundState();
+                io.emit("init_data", await buildPublicInitPayload());
+                io.to("admins").emit("admin_rounds_changed");
+                return f;
+            });
             await logAdminAction("FINISH_ROUND", { user: userId, roundId: finished.id, name: finished.name });
-            roundState = await loadRoundState();
-            io.emit("init_data", await buildPublicInitPayload());
-            io.to("admins").emit("admin_rounds_changed");
             if (typeof callback === 'function') callback({ success: true });
         } catch (err) {
             if (!isMaintenanceError(err)) console.error(err);
@@ -1228,17 +1292,22 @@ io.on("connection", async (socket) => {
             // здесь нужна: черновик никогда не имел пикселей/истории/снимков
             // (они создаются только для активного раунда), поэтому удаление
             // черновика не может задеть данные завершённых раундов.
-            const res = await withGameOp(() => pool.query(
-                "DELETE FROM rounds WHERE id = $1 AND status = 'draft' RETURNING id, name",
-                [roundId]
-            ));
-            if (res.rows.length === 0) {
+            const deleted = await withGameOp(async () => {
+                const res = await pool.query(
+                    "DELETE FROM rounds WHERE id = $1 AND status = 'draft' RETURNING id, name",
+                    [roundId]
+                );
+                if (res.rows.length === 0) return null;
+                await testPostDbDelay();
+                roundState = await loadRoundState();
+                io.to("admins").emit("admin_rounds_changed");
+                io.emit("round_updated", { upcoming: publicUpcoming(roundState.upcoming) });
+                return res.rows[0];
+            });
+            if (!deleted) {
                 return callback && callback({ success: false, error: "Удалить можно только черновик" });
             }
-            await logAdminAction("DELETE_ROUND", { user: userId, roundId, name: res.rows[0].name });
-            roundState = await loadRoundState();
-            io.to("admins").emit("admin_rounds_changed");
-            io.emit("round_updated", { upcoming: publicUpcoming(roundState.upcoming) });
+            await logAdminAction("DELETE_ROUND", { user: userId, roundId, name: deleted.name });
             if (typeof callback === 'function') callback({ success: true });
         } catch (err) {
             if (!isMaintenanceError(err)) console.error(err);
@@ -1269,14 +1338,17 @@ io.on("connection", async (socket) => {
 
         const { pixels } = normalized.value;
         try {
-            await withGameOp(() => withTransaction(pool, async (client) => {
-                await client.query("DELETE FROM pixels WHERE round_id = $1", [round.id]);
-                await bulkInsertPixels(client, round.id, pixels);
-            }));
+            await withGameOp(async () => {
+                await withTransaction(pool, async (client) => {
+                    await client.query("DELETE FROM pixels WHERE round_id = $1", [round.id]);
+                    await bulkInsertPixels(client, round.id, pixels);
+                });
+                await testPostDbDelay();
+                roundState = await loadRoundState();
+                io.emit("init_data", await buildPublicInitPayload());
+            });
 
             await logAdminAction("IMPORT_DB", { user: userId, roundId: round.id, pixelCount: pixels.length });
-            roundState = await loadRoundState();
-            io.emit("init_data", await buildPublicInitPayload());
             if (typeof callback === "function") callback({ success: true });
         } catch (err) {
             if (!isMaintenanceError(err)) console.error("Import error:", err);
@@ -1295,30 +1367,34 @@ io.on("connection", async (socket) => {
         }
 
         try {
-            const restoredPixels = await withGameOp(() => withTransaction(pool, async (client) => {
-                const targetTime = new Date(Date.now() - rollback.timeAgoMinutes * 60 * 1000);
-                const res = await client.query(`
-                    SELECT DISTINCT ON (x, y) x, y, color, user_id
-                    FROM pixel_history
-                    WHERE round_id = $1 AND x >= $2 AND x <= $3 AND y >= $4 AND y <= $5 AND created_at <= $6
-                    ORDER BY x, y, created_at DESC
-                `, [round.id, rollback.x1, rollback.x2, rollback.y1, rollback.y2, targetTime]);
+            const restoredPixels = await withGameOp(async () => {
+                const count = await withTransaction(pool, async (client) => {
+                    const targetTime = new Date(Date.now() - rollback.timeAgoMinutes * 60 * 1000);
+                    const res = await client.query(`
+                        SELECT DISTINCT ON (x, y) x, y, color, user_id
+                        FROM pixel_history
+                        WHERE round_id = $1 AND x >= $2 AND x <= $3 AND y >= $4 AND y <= $5 AND created_at <= $6
+                        ORDER BY x, y, created_at DESC
+                    `, [round.id, rollback.x1, rollback.x2, rollback.y1, rollback.y2, targetTime]);
 
-                await client.query(
-                    "DELETE FROM pixels WHERE round_id = $1 AND x >= $2 AND x <= $3 AND y >= $4 AND y <= $5",
-                    [round.id, rollback.x1, rollback.x2, rollback.y1, rollback.y2]
-                );
+                    await client.query(
+                        "DELETE FROM pixels WHERE round_id = $1 AND x >= $2 AND x <= $3 AND y >= $4 AND y <= $5",
+                        [round.id, rollback.x1, rollback.x2, rollback.y1, rollback.y2]
+                    );
 
-                // Восстанавливаем только те цвета, что всё ещё входят в палитру раунда.
-                const restorable = res.rows.filter(p => isColorInPalette(p.color, round.palette));
-                await bulkInsertPixels(client, round.id, restorable);
+                    // Восстанавливаем только те цвета, что всё ещё входят в палитру раунда.
+                    const restorable = res.rows.filter(p => isColorInPalette(p.color, round.palette));
+                    await bulkInsertPixels(client, round.id, restorable);
 
-                return restorable.length;
-            }));
+                    return restorable.length;
+                });
+                await testPostDbDelay();
+                roundState = await loadRoundState();
+                io.emit("init_data", await buildPublicInitPayload());
+                return count;
+            });
 
             await logAdminAction("ROLLBACK_AREA", { user: userId, roundId: round.id, ...rollback });
-            roundState = await loadRoundState();
-            io.emit("init_data", await buildPublicInitPayload());
             if (typeof callback === "function") callback({ success: true, count: restoredPixels });
         } catch (err) {
             if (!isMaintenanceError(err)) console.error("Rollback error:", err);

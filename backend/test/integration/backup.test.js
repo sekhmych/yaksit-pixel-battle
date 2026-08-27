@@ -330,6 +330,119 @@ test("game backup: restore waits for an in-flight game operation and leaves no s
     assert.equal(roundsAfter.rows.length, 0, "no stale round survives restore, even though it was in flight when restore started");
 });
 
+test("game backup: restore waits for the FULL lifecycle of an in-flight operation (DB + roundState + broadcast), not just its SQL", { timeout: 30000 }, async (t) => {
+    // TEST_GAME_OP_POST_DB_DELAY_MS pauses a game operation AFTER its DB write
+    // has already committed but BEFORE it reloads roundState and broadcasts -
+    // exactly the gap that used to let a stale operation finish its lifecycle
+    // (roundState mutation + io.emit) after restore had already taken over.
+    const server = await startTestServer({
+        dbPrefix: "pixelbattle_it_backup_race_lifecycle",
+        extraEnv: { TEST_GAME_OP_POST_DB_DELAY_MS: "1200" }
+    });
+    t.after(() => server.stop());
+
+    const admin = await adminSession(server.baseUrl);
+    t.after(() => admin.close());
+
+    // Seed one draft round to start_round during the race. Setup itself also
+    // pays the artificial delay (this server always adds it), so just await
+    // it fully - only the race window below matters for the test.
+    // starts_at is intentionally far in the future so the background
+    // auto-start scheduler (which polls every ROUND_SYNC_INTERVAL_MS, as
+    // fast as 300ms in tests) never races to activate this draft on its own -
+    // the test needs to control exactly when start_round fires.
+    const now = Date.now();
+    const createRes = await admin.emit("create_round", {
+        name: "Racy started round",
+        starts_at: new Date(now + 3600 * 1000).toISOString(),
+        ends_at: new Date(now + 7200 * 1000).toISOString(),
+        canvas_size: 10,
+        cooldown: 1,
+        bg_color: "#000000",
+        grid_enabled: true,
+        palette: ["#ffffff"]
+    });
+    assert.equal(createRes.success, true, JSON.stringify(createRes));
+    const racyRoundId = createRes.round.id;
+
+    // Collect every init_data broadcast the admin socket receives from this
+    // point on (io.emit sends to every connected client, admin included) -
+    // this is exactly what a real client would see.
+    const receivedInitData = [];
+    admin.socket.on("init_data", (payload) => {
+        receivedInitData.push({ payload, t: Date.now() });
+    });
+
+    const emptyBackup = {
+        format: BACKUP_FORMAT,
+        version: BACKUP_VERSION,
+        exported_at: new Date().toISOString(),
+        data: { rounds: [], pixels: [], pixel_history: [], snapshots: [], round_archives: [] }
+    };
+
+    const order = [];
+
+    // start_round: DB commit happens first, then (only in this test server)
+    // an artificial pause, THEN roundState is reloaded and "init_data" is
+    // broadcast to everyone, including this ack resolving last.
+    const startPromise = admin.emit("start_round", { id: racyRoundId })
+        .then((res) => { order.push("start_round_ack"); return res; });
+
+    // Give start_round time to commit its transaction and enter the paused
+    // window (activeGameOps stays 1 throughout), but not enough to finish it.
+    await sleep(300);
+
+    const restorePromise = httpRequest("POST", `${server.baseUrl}/admin/backup/restore`, {
+        headers: { Cookie: admin.cookies, "X-CSRF-Token": admin.csrfToken },
+        body: emptyBackup
+    }).then((res) => { order.push("restore_response"); return res; });
+
+    const [startResult, restoreResult] = await Promise.all([startPromise, restorePromise]);
+
+    // 1. Restore waited for the ENTIRE lifecycle of the in-flight operation,
+    // not just its SQL: start_round's ack (which only resolves after its own
+    // roundState reload + broadcast) completed strictly before restore's
+    // HTTP response.
+    assert.equal(startResult.success, true, JSON.stringify(startResult));
+    assert.deepEqual(order, ["start_round_ack", "restore_response"], "restore must wait for the full lifecycle (DB + roundState + broadcast), not just the DB write");
+
+    assert.equal(restoreResult.status, 200, restoreResult.body);
+    const restoreBody = JSON.parse(restoreResult.body);
+    assert.equal(restoreBody.success, true);
+    assert.deepEqual(restoreBody.summary, { rounds: 0, pixels: 0, pixelHistory: 0, snapshots: 0, roundArchives: 0 });
+
+    // A short grace period: if the fix were broken, this is where a stale,
+    // late roundState reload / broadcast from the old start_round handler
+    // would show up - it no longer exists as a code path once the operation
+    // itself is gate-scoped to its full lifecycle, but this also guards
+    // against any other route to a delayed event.
+    await sleep(400);
+
+    // 2 & 3. After restore, both the events observed by the client AND the
+    // server's own roundState must reflect the backup - not the racy round.
+    // We expect exactly two init_data broadcasts: the racy start_round's own
+    // (round still shows as active, because it legitimately finished before
+    // restore started), followed by restore's own (round is null, matching
+    // the empty backup).
+    assert.equal(receivedInitData.length, 2, `expected exactly 2 init_data broadcasts, got ${receivedInitData.length}: ${JSON.stringify(receivedInitData.map(e => e.payload.round))}`);
+    assert.ok(receivedInitData[0].payload.round && receivedInitData[0].payload.round.id === racyRoundId && receivedInitData[0].payload.round.status === "active", "the racy start_round's own broadcast legitimately shows the round as active - it started before restore and was allowed to finish");
+    assert.equal(receivedInitData[1].payload.round, null, "restore's own broadcast (the FINAL one the client sees) matches the empty backup exactly");
+
+    // 4. No late/stale event arrives after restore's response - a fresh
+    // client connecting right now must see exactly the backup's state, not
+    // some in-between or stale value left over from the racy start_round.
+    const freshVisitor = await visitorSession(server.baseUrl);
+    t.after(() => freshVisitor.close());
+    assert.equal(freshVisitor.initData.round, null, "a client connecting after restore sees exactly the backup's state (no active round), never the racy start_round's");
+
+    // And still nothing new arrived on the admin socket in the meantime.
+    assert.equal(receivedInitData.length, 2, "no further init_data broadcasts arrived after restore's own");
+
+    // 5. The database matches the backup exactly: no leftover round.
+    const roundsAfter = await server.pool.query("SELECT * FROM rounds");
+    assert.equal(roundsAfter.rows.length, 0, "the database matches the (empty) backup - no stale round left behind by the racy start_round");
+});
+
 test("game backup: export is rejected with 413 (not a partial download) when it would exceed BACKUP_MAX_BYTES", { timeout: 30000 }, async (t) => {
     // A tiny BACKUP_MAX_BYTES guarantees any non-trivial export exceeds it,
     // exercising the symmetric size check on the export side.

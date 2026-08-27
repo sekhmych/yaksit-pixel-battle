@@ -249,6 +249,10 @@ async function finishRound(client, { roundId, preview, pixelCount, buildArchive 
 
 module.exports = {
     STATUSES,
+    MIN_CANVAS_SIZE,
+    MAX_CANVAS_SIZE,
+    MIN_COOLDOWN,
+    MAX_COOLDOWN,
     isValidPalette,
     isColorInPalette,
     normalizeRoundInput,

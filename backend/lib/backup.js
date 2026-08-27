@@ -6,7 +6,7 @@
 // служебное состояние, не являющееся игровым прогрессом.
 
 const { isValidColor } = require("./validation");
-const { isValidPalette } = require("./rounds");
+const { isValidPalette, MIN_CANVAS_SIZE, MAX_CANVAS_SIZE, MIN_COOLDOWN, MAX_COOLDOWN } = require("./rounds");
 
 const BACKUP_FORMAT = "yaksit-pixel-battle-game-backup";
 const BACKUP_VERSION = 1;
@@ -219,10 +219,22 @@ function validateBackup(json, options = {}) {
         if (!isIsoDateString(r.starts_at) || !isIsoDateString(r.ends_at)) {
             return { ok: false, error: `Некорректные даты начала/окончания раунда #${r.id}.` };
         }
-        if (!isPositiveInt(r.canvas_size) || r.canvas_size > 100000) {
-            return { ok: false, error: `Некорректный размер холста раунда #${r.id}.` };
+        // Ту же границу времени, что и обычное создание/редактирование раунда
+        // (normalizeRoundInput в rounds.js): конец строго позже начала - иначе
+        // restore мог бы создать раунд, немыслимый через штатный API.
+        if (new Date(r.ends_at).getTime() <= new Date(r.starts_at).getTime()) {
+            return { ok: false, error: `Раунд #${r.id}: ends_at должен быть строго позже starts_at.` };
         }
-        if (!isNonNegativeInt(r.cooldown)) return { ok: false, error: `Некорректный кулдаун раунда #${r.id}.` };
+        // Те же границы размера холста и кулдауна, что и normalizeRoundInput -
+        // единый источник истины в rounds.js, чтобы restore не мог создать
+        // раунд, который обычная админка отклонила бы (в частности, огромный
+        // canvas_size ведёт к чрезмерному потреблению памяти при рендере PNG).
+        if (!isPositiveInt(r.canvas_size) || r.canvas_size < MIN_CANVAS_SIZE || r.canvas_size > MAX_CANVAS_SIZE) {
+            return { ok: false, error: `Некорректный размер холста раунда #${r.id}: должен быть от ${MIN_CANVAS_SIZE} до ${MAX_CANVAS_SIZE}.` };
+        }
+        if (!isNonNegativeInt(r.cooldown) || r.cooldown < MIN_COOLDOWN || r.cooldown > MAX_COOLDOWN) {
+            return { ok: false, error: `Некорректный кулдаун раунда #${r.id}: должен быть от ${MIN_COOLDOWN} до ${MAX_COOLDOWN}.` };
+        }
         if (!isValidColor(r.bg_color)) return { ok: false, error: `Некорректный цвет фона раунда #${r.id}.` };
         if (typeof r.grid_enabled !== "boolean") return { ok: false, error: `Некорректное поле grid_enabled раунда #${r.id}.` };
         if (!isValidPalette(r.palette)) return { ok: false, error: `Некорректная палитра раунда #${r.id}.` };
