@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "build:css": "tailwindcss -i ./html/src/input.css -o ./html/tailwind.css --minify",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "npm --prefix backend test"
   },
   "repository": {
     "type": "git",
