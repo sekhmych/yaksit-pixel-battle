@@ -128,6 +128,32 @@ async function waitForHealth(baseUrl, timeoutMs = 20000) {
     }
 }
 
+// Аналогично waitForHealth(), но для /ready - используется тестами startup
+// lifecycle, которым нужно дождаться именно полной готовности (после
+// initDatabase() + фоновых задач + успешного listen()), а не просто того,
+// что процесс жив.
+async function waitForReady(baseUrl, timeoutMs = 20000) {
+    const start = Date.now();
+    for (;;) {
+        try {
+            const res = await httpGet(baseUrl + "/ready");
+            if (res.status === 200) return;
+        } catch (err) { /* сервер/порт ещё не готовы */ }
+        if (Date.now() - start > timeoutMs) {
+            throw new Error("Server did not become ready in time");
+        }
+        await sleep(150);
+    }
+}
+
+// Пытается открыть TCP-соединение на baseUrl - используется тестами startup
+// race, чтобы доказать (а не просто предположить по логам/флагам), что порт
+// ДЕЙСТВИТЕЛЬНО ещё не слушается: подключение к не открытому localhost-порту
+// проваливается почти мгновенно с ECONNREFUSED, ждать не нужно.
+function isPortOpen(baseUrl) {
+    return httpGet(baseUrl + "/health").then(() => true).catch(() => false);
+}
+
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -196,12 +222,32 @@ async function startTestServer(options = {}) {
     child.stderr.on("data", (d) => { stderr += d.toString(); });
     child.stdout.on("data", (d) => { stdout += d.toString(); });
 
-    try {
-        await waitForHealth(baseUrl);
-    } catch (err) {
-        child.kill("SIGKILL");
-        await dropTestDatabase(dbName).catch(() => {});
-        throw new Error(`Server failed to start: ${err.message}\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`);
+    // Единственное место, где фиксируется факт и подробности выхода
+    // дочернего процесса - используется и waitForExit(), и stop(), чтобы не
+    // пытаться убить уже завершившийся процесс (SIGTERM/SIGKILL по мёртвому
+    // pid либо no-op, либо ошибка ESRCH).
+    let exitInfo = null;
+    const exitPromise = new Promise((resolve) => {
+        child.once("exit", (code, signal) => {
+            exitInfo = { code, signal };
+            resolve(exitInfo);
+        });
+    });
+
+    // options.waitForStartup === false пропускает ожидание /health - нужно
+    // тестам startup-гонки (SIGTERM во время initDatabase()/до listen()),
+    // которым важно управлять сигналом раньше, чем сервер вообще успеет
+    // подняться. По умолчанию (как и раньше) ждём - это не должно ломать ни
+    // один существующий тест.
+    const waitForStartup = options.waitForStartup !== false;
+    if (waitForStartup) {
+        try {
+            await waitForHealth(baseUrl);
+        } catch (err) {
+            child.kill("SIGKILL");
+            await dropTestDatabase(dbName).catch(() => {});
+            throw new Error(`Server failed to start: ${err.message}\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`);
+        }
     }
 
     const pool = adminConnection(dbName);
@@ -211,15 +257,55 @@ async function startTestServer(options = {}) {
         port,
         dbName,
         pool,
+        child,
         getLogs: () => ({ stdout, stderr }),
-        async stop() {
+        getExitInfo: () => exitInfo,
+        // Для тестов, запущенных с waitForStartup: false - дождаться
+        // /health или /ready самостоятельно, в нужный тесту момент.
+        waitForHealth: (timeoutMs) => waitForHealth(baseUrl, timeoutMs),
+        waitForReady: (timeoutMs) => waitForReady(baseUrl, timeoutMs),
+        isPortOpen: () => isPortOpen(baseUrl),
+        // Отправляет сигнал дочернему процессу напрямую - используется
+        // тестами graceful shutdown, которым нужен полный контроль над
+        // моментом отправки SIGTERM/SIGINT (в отличие от stop(), который
+        // сам решает, когда и как останавливать сервер при уборке теста).
+        // No-op, если процесс уже завершился.
+        signal(sig = "SIGTERM") {
+            if (exitInfo) return;
+            child.kill(sig);
+        },
+        // Ждёт реального завершения процесса (а не просто HTTP-ответа) и
+        // возвращает { code, signal } - тесты используют это, чтобы отличить
+        // штатный graceful-выход (code === 0, signal === null) от
+        // принудительного (SIGKILL fallback ниже, или ненулевой exit code
+        // при неудавшемся graceful shutdown).
+        waitForExit(timeoutMs = 20000) {
+            if (exitInfo) return Promise.resolve(exitInfo);
+            return Promise.race([
+                exitPromise,
+                new Promise((_, reject) => setTimeout(
+                    () => reject(new Error(`Процесс не завершился за ${timeoutMs}мс`)),
+                    timeoutMs
+                ))
+            ]);
+        },
+        // Даёт серверу шанс на настоящий graceful SIGTERM-выход (теперь,
+        // когда он есть) и только если тот не укладывается в отведённое
+        // время - принудительно добивает SIGKILL. Жёсткий SIGKILL остаётся
+        // только аварийным fallback самого test harness, а не основным
+        // способом остановки.
+        async stop({ forceKillAfterMs = 10000 } = {}) {
             await pool.end().catch(() => {});
-            await new Promise((resolve) => {
-                child.once("exit", resolve);
-                child.kill("SIGTERM");
-                const forceKill = setTimeout(() => child.kill("SIGKILL"), 3000);
-                forceKill.unref();
-            });
+            if (!exitInfo) {
+                await new Promise((resolve) => {
+                    child.kill("SIGTERM");
+                    const forceKill = setTimeout(() => {
+                        if (!exitInfo) child.kill("SIGKILL");
+                    }, forceKillAfterMs);
+                    forceKill.unref();
+                    exitPromise.then(resolve);
+                });
+            }
             if (dropOnStop) {
                 await dropTestDatabase(dbName).catch(() => {});
             }
