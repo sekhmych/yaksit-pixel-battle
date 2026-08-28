@@ -128,6 +128,32 @@ async function waitForHealth(baseUrl, timeoutMs = 20000) {
     }
 }
 
+// Аналогично waitForHealth(), но для /ready - используется тестами startup
+// lifecycle, которым нужно дождаться именно полной готовности (после
+// initDatabase() + фоновых задач + успешного listen()), а не просто того,
+// что процесс жив.
+async function waitForReady(baseUrl, timeoutMs = 20000) {
+    const start = Date.now();
+    for (;;) {
+        try {
+            const res = await httpGet(baseUrl + "/ready");
+            if (res.status === 200) return;
+        } catch (err) { /* сервер/порт ещё не готовы */ }
+        if (Date.now() - start > timeoutMs) {
+            throw new Error("Server did not become ready in time");
+        }
+        await sleep(150);
+    }
+}
+
+// Пытается открыть TCP-соединение на baseUrl - используется тестами startup
+// race, чтобы доказать (а не просто предположить по логам/флагам), что порт
+// ДЕЙСТВИТЕЛЬНО ещё не слушается: подключение к не открытому localhost-порту
+// проваливается почти мгновенно с ECONNREFUSED, ждать не нужно.
+function isPortOpen(baseUrl) {
+    return httpGet(baseUrl + "/health").then(() => true).catch(() => false);
+}
+
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -208,12 +234,20 @@ async function startTestServer(options = {}) {
         });
     });
 
-    try {
-        await waitForHealth(baseUrl);
-    } catch (err) {
-        child.kill("SIGKILL");
-        await dropTestDatabase(dbName).catch(() => {});
-        throw new Error(`Server failed to start: ${err.message}\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`);
+    // options.waitForStartup === false пропускает ожидание /health - нужно
+    // тестам startup-гонки (SIGTERM во время initDatabase()/до listen()),
+    // которым важно управлять сигналом раньше, чем сервер вообще успеет
+    // подняться. По умолчанию (как и раньше) ждём - это не должно ломать ни
+    // один существующий тест.
+    const waitForStartup = options.waitForStartup !== false;
+    if (waitForStartup) {
+        try {
+            await waitForHealth(baseUrl);
+        } catch (err) {
+            child.kill("SIGKILL");
+            await dropTestDatabase(dbName).catch(() => {});
+            throw new Error(`Server failed to start: ${err.message}\n--- stdout ---\n${stdout}\n--- stderr ---\n${stderr}`);
+        }
     }
 
     const pool = adminConnection(dbName);
@@ -226,6 +260,11 @@ async function startTestServer(options = {}) {
         child,
         getLogs: () => ({ stdout, stderr }),
         getExitInfo: () => exitInfo,
+        // Для тестов, запущенных с waitForStartup: false - дождаться
+        // /health или /ready самостоятельно, в нужный тесту момент.
+        waitForHealth: (timeoutMs) => waitForHealth(baseUrl, timeoutMs),
+        waitForReady: (timeoutMs) => waitForReady(baseUrl, timeoutMs),
+        isPortOpen: () => isPortOpen(baseUrl),
         // Отправляет сигнал дочернему процессу напрямую - используется
         // тестами graceful shutdown, которым нужен полный контроль над
         // моментом отправки SIGTERM/SIGINT (в отличие от stop(), который

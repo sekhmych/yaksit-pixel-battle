@@ -659,20 +659,42 @@ async function synchronizeRounds() {
     await autoStartEligibleDraft();
 }
 
-// Ссылки на все три интервала сохраняются, чтобы graceful shutdown мог их
-// остановить (clearInterval) ДО ожидания уже начатых операций - иначе фон
-// мог бы запустить новую игровую мутацию уже после того, как shutdown начал
-// закрывать ресурсы.
-let snapshotIntervalHandle = setInterval(() => { takeSnapshot().catch(() => { /* уже обработано внутри takeSnapshot */ }); }, 10 * 60 * 1000); // Снимок каждые 10 минут
-let syncIntervalHandle = setInterval(synchronizeRounds, ROUND_SYNC_INTERVAL_MS); // Автозавершение + автозапуск по расписанию
-let cleanupIntervalHandle = setInterval(async () => {
-    try {
-        await withGameOp(() => pool.query("DELETE FROM pixel_history WHERE created_at < NOW() - INTERVAL '48 hours'"));
-        console.log("[Cleanup] Старая история удалена");
-    } catch (err) {
-        if (!isMaintenanceError(err)) console.error("Cleanup error:", err);
-    }
-}, 60 * 60 * 1000); // Очистка каждый час
+// Фоновые задачи стартуют СТРОГО после успешной initDatabase() - до этого
+// момента PostgreSQL может быть недоступен, миграции ещё не выполнены, а
+// roundState ещё не загружен. Ссылки на все три интервала сохраняются
+// (и обнуляются при остановке), чтобы graceful shutdown мог их остановить
+// ДО ожидания уже начатых операций - иначе фон мог бы запустить новую
+// игровую мутацию уже после того, как shutdown начал закрывать ресурсы.
+let snapshotIntervalHandle = null;
+let syncIntervalHandle = null;
+let cleanupIntervalHandle = null;
+let backgroundTasksStarted = false;
+
+// Идемпотентна: повторный вызов (или вызов после неуспешного/ещё не
+// завершённого init, или после начала shutdown) - no-op.
+function startBackgroundTasks() {
+    if (backgroundTasksStarted) return;
+    backgroundTasksStarted = true;
+    snapshotIntervalHandle = setInterval(() => { takeSnapshot().catch(() => { /* уже обработано внутри takeSnapshot */ }); }, 10 * 60 * 1000); // Снимок каждые 10 минут
+    syncIntervalHandle = setInterval(synchronizeRounds, ROUND_SYNC_INTERVAL_MS); // Автозавершение + автозапуск по расписанию
+    cleanupIntervalHandle = setInterval(async () => {
+        try {
+            await withGameOp(() => pool.query("DELETE FROM pixel_history WHERE created_at < NOW() - INTERVAL '48 hours'"));
+            console.log("[Cleanup] Старая история удалена");
+        } catch (err) {
+            if (!isMaintenanceError(err)) console.error("Cleanup error:", err);
+        }
+    }, 60 * 60 * 1000); // Очистка каждый час
+}
+
+// Идемпотентна: безопасно звать даже если задачи никогда не запускались
+// (handles уже null - clearInterval(null) - no-op) или уже остановлены.
+function stopBackgroundTasks() {
+    if (snapshotIntervalHandle) { clearInterval(snapshotIntervalHandle); snapshotIntervalHandle = null; }
+    if (syncIntervalHandle) { clearInterval(syncIntervalHandle); syncIntervalHandle = null; }
+    if (cleanupIntervalHandle) { clearInterval(cleanupIntervalHandle); cleanupIntervalHandle = null; }
+    backgroundTasksStarted = false;
+}
 
 function sendHtmlWithContext(res, filePath, csrfToken = null) {
     fs.readFile(filePath, 'utf8', (err, data) => {
@@ -1539,11 +1561,49 @@ io.on("connection", async (socket) => {
 
 // === ЗАПУСК ===
 
+// Startup - это тоже lifecycle-операция, которую graceful shutdown обязан
+// дождаться перед закрытием PostgreSQL pool (иначе SIGTERM, пришедший пока
+// initDatabase() ещё держит клиента и выполняет миграции, мог бы закрыть
+// pool прямо посреди SQL). В activeGameOps её намеренно не включаем - это
+// другое понятие (игровые мутации после того, как приложение уже готово),
+// а не сам процесс становления готовым.
+let startupInProgress = true;
+let startupSettledWaiters = [];
+function waitForStartupToSettle() {
+    if (!startupInProgress) return Promise.resolve();
+    return new Promise((resolve) => { startupSettledWaiters.push(resolve); });
+}
+function markStartupSettled() {
+    startupInProgress = false;
+    const waiters = startupSettledWaiters;
+    startupSettledWaiters = [];
+    waiters.forEach(resolve => resolve());
+}
+
+// Только для интеграционных тестов: пауза внутри initDatabase(), уже ПОСЛЕ
+// того как соединение с БД получено, но ДО начала миграций - открывает
+// детерминированное окно, чтобы послать SIGTERM/SIGINT ровно во время
+// старта и доказать, что shutdown дожидается инициализации, а не обрывает
+// её. В production не задаётся - задержки нет.
+const TEST_INIT_DB_DELAY_MS = Number(process.env.TEST_INIT_DB_DELAY_MS) || 0;
+// Только для интеграционных тестов (и только при NODE_ENV=test - production
+// от этой переменной никак не зависит): детерминированно проваливает
+// initDatabase(), чтобы проверить startup failure path без необходимости
+// реально ломать PostgreSQL.
+const TEST_INIT_DB_FAIL = TEST_MODE && process.env.TEST_INIT_DB_FAIL === "1";
+
 async function initDatabase() {
     let client;
     let connected = false;
     let attempts = 0;
     while (!connected) {
+        // Если shutdown уже начался (например, SIGTERM пришёл, пока сервер
+        // ещё не подключился к БД - retry ещё не исчерпан), нет смысла
+        // продолжать retry-цикл вплоть до 30 попыток - прерываемся сразу,
+        // чтобы shutdown не пришлось ждать до истечения SHUTDOWN_TIMEOUT_MS.
+        if (shuttingDown) {
+            throw new Error("STARTUP_ABORTED_SHUTDOWN");
+        }
         try {
             attempts++;
             client = await pool.connect();
@@ -1552,14 +1612,17 @@ async function initDatabase() {
         } catch (err) {
             console.log(`[${attempts}] Ожидание БД... (${err.message})`);
             if (attempts > 30) {
-                console.error("Не удалось подключиться к БД после 30 попыток.");
-                process.exit(1);
+                throw new Error("Не удалось подключиться к БД после 30 попыток.");
             }
             await sleep(2000);
         }
     }
 
     try {
+        // Тестовые хуки - оба no-op в production (переменные не заданы).
+        if (TEST_INIT_DB_DELAY_MS > 0) await sleep(TEST_INIT_DB_DELAY_MS);
+        if (TEST_INIT_DB_FAIL) throw new Error("TEST_INIT_DB_FAIL");
+
         console.log("Проверка и инициализация таблиц...");
 
         // 1. Сессии
@@ -1778,7 +1841,11 @@ async function initDatabase() {
         console.log("Инициализация БД успешно завершена.");
     } catch (err) {
         console.error("Ошибка при инициализации БД:", err);
-        process.exit(1);
+        // Больше не завершает процесс напрямую - решение о том, что делать
+        // с неудавшимся стартом (обычное падение vs. уже идущий graceful
+        // shutdown), принимает вызывающий код (startServer()), который
+        // единственный знает актуальный lifecycle-контекст.
+        throw err;
     } finally {
         if (client) client.release();
     }
@@ -1812,15 +1879,20 @@ function withTimeout(promise, ms, label) {
     return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
-// Единый идемпотентный обработчик SIGTERM/SIGINT. Последовательность шагов
-// соответствует production-требованиям: (1) синхронно закрыть gate для
-// новых игровых мутаций и пометить /health и /ready как неготовые, (2)
-// остановить фоновые интервалы, чтобы они не запускали новые мутации, (3)
-// дождаться уже начатых игровых операций и (если он прямо сейчас
+// Единый идемпотентный обработчик SIGTERM/SIGINT. Последовательность шагов:
+// (1) синхронно закрыть gate для новых игровых мутаций и пометить /health и
+// /ready как неготовые - работает одинаково независимо от того, в какой
+// фазе lifecycle (старт, обычная работа, restore) сейчас находится сервер,
+// (2) остановить фоновые интервалы (idempotently - если они ещё не успели
+// стартовать, это no-op, а startServer() сам не запустит их, увидев
+// shuttingDown), (3) дождаться уже начатой инициализации (initDatabase()
+// могла ещё держать клиента и выполнять миграции/SQL - закрывать pool
+// посреди этого нельзя), уже начатых игровых операций, и (если прямо сейчас
 // выполняется) restore целиком - его finally не откроет gate заново, см.
-// endRestore(), (4) уведомить клиентов и закрыть Socket.IO/HTTP, (5)
+// endRestore(), (4) уведомить клиентов и закрыть Socket.IO/HTTP (если
+// listener так и не успел подняться до начала shutdown - это no-op), (5)
 // закрыть PostgreSQL pool последним. Всё это - под одним общим таймаутом
-// SHUTDOWN_TIMEOUT_MS.
+// SHUTDOWN_TIMEOUT_MS, покрывающим в том числе и ожидание старта.
 async function gracefulShutdown(signal) {
     // Повторный сигнал во время уже идущего shutdown осознанно игнорируется
     // (с логом) - см. README: это самый простой безопасный вариант, не
@@ -1843,24 +1915,30 @@ async function gracefulShutdown(signal) {
 
     try {
         // Шаг 2: фоновые задачи больше не должны стартовать новую мутацию.
-        clearInterval(snapshotIntervalHandle);
-        clearInterval(syncIntervalHandle);
-        clearInterval(cleanupIntervalHandle);
+        // Идемпотентно и безопасно, даже если они ещё не успели запуститься
+        // (startServer() ещё не дошёл до startBackgroundTasks()) - тогда это
+        // no-op, а startServer() сам проверит shuttingDown и не запустит их.
+        stopBackgroundTasks();
         console.log("[Shutdown] Фоновые интервалы остановлены.");
 
-        // Шаг 3: ждём уже начатые игровые операции ЦЕЛИКОМ - и обычные
-        // (через activeGameOps), и, если прямо сейчас идёт restore, весь его
-        // жизненный цикл (транзакция + roundState + рассылка). Именно это
-        // не даёт shutdown закрыть PostgreSQL посреди транзакции restore.
+        // Шаг 3: ждём (в указанном порядке, но все - под одним общим
+        // дедлайном) уже начатую инициализацию (initDatabase() могла ещё
+        // держать клиента и выполнять миграции/SQL, когда пришёл сигнал -
+        // закрывать pool посреди этого нельзя), затем уже начатые игровые
+        // операции ЦЕЛИКОМ - и обычные (через activeGameOps), и, если прямо
+        // сейчас идёт restore, весь его жизненный цикл (транзакция +
+        // roundState + рассылка). Именно это не даёт shutdown закрыть
+        // PostgreSQL ни посреди старта, ни посреди транзакции restore.
         await withTimeout(
             (async () => {
+                await waitForStartupToSettle();
                 await waitForGameOpsDrain();
                 await waitForRestoreToFinish();
             })(),
             remaining(),
-            "ожидание уже начатых игровых операций"
+            "ожидание завершения инициализации и уже начатых игровых операций"
         );
-        console.log("[Shutdown] Все игровые операции завершены.");
+        console.log("[Shutdown] Инициализация и все игровые операции завершены.");
 
         // Шаг 5 (Socket.IO -> HTTP -> Postgres): предупреждаем клиентов,
         // разрываем уже открытые соединения (иначе висящие websocket-ы не
@@ -1893,14 +1971,72 @@ async function gracefulShutdown(signal) {
 process.on("SIGTERM", () => { gracefulShutdown("SIGTERM"); });
 process.on("SIGINT", () => { gracefulShutdown("SIGINT"); });
 
+// Startup сломался САМ ПО СЕБЕ (не из-за shutdown) - решение о завершении
+// процесса принимается здесь, на верхнем уровне, а не глубоко внутри
+// initDatabase(). Закрывает pool (он мог быть частично инициализирован) и
+// выходит с ненулевым кодом - без этого контейнер завис бы, так и не начав
+// слушать порт, но и не завершившись.
+async function failStartup(err) {
+    console.error("[Startup] Критическая ошибка запуска, процесс завершается:", err.message);
+    try { await pool.end(); } catch (_) { /* no-op */ }
+    process.exit(1);
+}
+
 async function startServer() {
-    await initDatabase();
-    // appReady только теперь: initDatabase() включает и миграции, и
-    // roundState = await loadRoundState() - контейнер не должен считаться
-    // готовым принимать трафик раньше этого момента (см. /ready).
-    appReady = true;
+    let initError = null;
+    try {
+        await initDatabase();
+    } catch (err) {
+        initError = err;
+    } finally {
+        // Отмечаем инициализацию завершённой (успешно или нет) ДО любых
+        // дальнейших решений - gracefulShutdown(), если он уже ждёт через
+        // waitForStartupToSettle(), должен получить уведомление в любом
+        // случае, а не только при успехе.
+        markStartupSettled();
+    }
+
+    if (initError) {
+        if (shuttingDown) {
+            // Второй, независимый от неудачи инициализации, lifecycle уже
+            // идёт (SIGTERM пришёл раньше или одновременно) - он сам
+            // корректно закроет pool и завершит процесс. Запускать здесь
+            // ещё один конкурирующий process.exit() нельзя.
+            console.log("[Startup] initDatabase() не завершился успешно, но shutdown уже идёт - им и займётся.");
+            return;
+        }
+        await failStartup(initError);
+        return;
+    }
+
+    if (shuttingDown) {
+        // SIGTERM/SIGINT пришёл, пока initDatabase() ещё выполнялся. Сама
+        // инициализация успела корректно завершиться, но HTTP listener
+        // запускать уже нельзя - gracefulShutdown() (который сейчас как раз
+        // ждёт нас через waitForStartupToSettle()) сам доведёт остановку до
+        // конца и закроет pool.
+        console.log("[Startup] initDatabase() завершился, но shutdown уже начался - background tasks и HTTP listener не запускаются.");
+        return;
+    }
+
+    // Фоновые задачи и HTTP listener стартуют только теперь - после
+    // успешной инициализации и при отсутствии уже начатого shutdown.
+    startBackgroundTasks();
+
     const PORT = config.port;
     server.listen(PORT, "0.0.0.0", () => {
+        // Между вызовом listen() и этим callback'ом сервер уже успевает
+        // слушать порт - на случай, если shutdown начался буквально в этом
+        // узком окне, проверяем ещё раз перед тем, как объявить готовность:
+        // appReady никогда не должен становиться true после начала
+        // shutdown, а только что открытый listener в этом случае сразу же
+        // закрывается сам, а не остаётся висеть незамеченным.
+        if (shuttingDown) {
+            console.log("[Startup] Shutdown начался, пока HTTP-сервер поднимался - appReady остаётся false, сразу закрываем listener.");
+            io.close(() => {});
+            return;
+        }
+        appReady = true;
         console.log(`>>> Сервер запущен! <<<`);
         console.log(`>>> Слушает на: 0.0.0.0:${PORT} <<<`);
     });
